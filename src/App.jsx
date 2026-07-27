@@ -141,6 +141,26 @@ JOB: ${jd}`;
   return geminiCall(key, [{ text: prompt }]);
 }
 
+async function makeInterviewPrep(key, profile, jd) {
+  const prompt = `You are an interview coach. Using the candidate's profile and the target job description, produce realistic interview prep. Ground behavioral answers in the candidate's REAL experience — never invent projects, employers, or metrics. Keep answers tight and usable.
+
+Return ONLY valid JSON (no markdown):
+{
+  "technical": [ {"q":"a technical question likely for this role","a":"a concise model answer / what a strong answer covers, tailored to the candidate's stack"} ],
+  "behavioral": [ {"q":"a behavioral question","a":"a STAR-style answer drawn from the candidate's real experience"} ],
+  "askThem": ["a sharp question the candidate could ask the interviewer"],
+  "focusAreas": ["skills or topics from the JD the candidate should brush up on before the interview"]
+}
+Aim for 5-6 technical, 4-5 behavioral, 3-4 askThem, 3-4 focusAreas.
+
+CANDIDATE PROFILE:
+${JSON.stringify(profile, null, 2)}
+
+TARGET JOB DESCRIPTION:
+${jd}`;
+  return JSON.parse(stripJson(await geminiCall(key, [{ text: prompt }])));
+}
+
 // ─── Theme: soft liquid-glass on a rich dark purple base ─────────────────────
 const P = {
   ink: "#f2eefc", muted: "#b6acd6", faint: "#8b81ad",
@@ -198,6 +218,9 @@ export default function App() {
   const [clLoading, setClLoading] = useState(false);
   const [history, setHistory] = useState(() => loadLS(LS_HISTORY, []));
   const [profileSaved, setProfileSaved] = useState(false);
+  const [prep, setPrep] = useState(null);
+  const [prepLoading, setPrepLoading] = useState(false);
+  const [prepJd, setPrepJd] = useState("");
   const [bgId, setBgId] = useState(() => loadLS("resumeTailor.bg", "forest"));
   useEffect(() => saveLS("resumeTailor.bg", bgId), [bgId]);
   const bg = BACKGROUNDS.find((b) => b.id === bgId) || BACKGROUNDS[0];
@@ -274,6 +297,16 @@ export default function App() {
     catch (err) { setStatus("Cover letter failed: " + err.message); }
     finally { setClLoading(false); }
   }
+  async function genPrep() {
+    if (!hasKey) { setStatus("Add your free Gemini API key first."); return; }
+    const useJd = prepJd.trim() || jd.trim();
+    if (!useJd) { setStatus("Paste a job description in the Interview Prep tab (or generate a resume first)."); return; }
+    if (!profileFilled) { setStatus("Fill your profile first so answers can use your real experience."); return; }
+    setPrepLoading(true); setStatus("Building your interview prep…");
+    try { setPrep(await makeInterviewPrep(apiKey, profile, useJd)); setStatus("Interview prep ready."); }
+    catch (err) { setStatus("Prep failed: " + err.message); }
+    finally { setPrepLoading(false); }
+  }
   function openHistory(e) { setResult(e.result); setTex(e.tex); setJd(e.jd); setCoverLetter(""); setTab("result"); setStatus(`Loaded: ${e.label}`); }
   function deleteHistory(id) { setHistory((h) => h.filter((e) => e.id !== id)); }
   function downloadTex() {
@@ -327,6 +360,7 @@ export default function App() {
           <button style={tabBtn(tab === "profile")} onClick={() => setTab("profile")}>1 · Profile</button>
           <button style={tabBtn(tab === "job")} onClick={() => setTab("job")}>2 · Job</button>
           <button style={tabBtn(tab === "result")} onClick={() => setTab("result")} disabled={!result}>3 · Result</button>
+          <button style={tabBtn(tab === "prep")} onClick={() => setTab("prep")}>🎤 Interview prep</button>
           <button style={tabBtn(tab === "history")} onClick={() => setTab("history")}>History ({history.length})</button>
         </div>
 
@@ -444,6 +478,47 @@ export default function App() {
           </div>
         )}
 
+        {tab === "prep" && (
+          <div style={glassCard}>
+            <SectionLabel>🎤 Interview prep</SectionLabel>
+            <div style={{ fontSize: 12.5, color: P.muted, marginBottom: 12 }}>
+              Generates likely questions and answers grounded in your saved profile. Uses the job description below — or the last one you generated a resume for.
+            </div>
+            <textarea value={prepJd} onChange={(e) => setPrepJd(e.target.value)} rows={6}
+              placeholder={jd.trim() ? "Leave blank to reuse your last job description, or paste a different one here…" : "Paste the job description you're interviewing for…"}
+              style={{ width: "100%", padding: "11px 13px", fontSize: 13, fontFamily: font, border: `1px solid ${P.fieldBorder}`, borderRadius: 12, background: P.field, boxSizing: "border-box", resize: "vertical", color: P.ink, outline: "none" }} />
+            <button style={{ ...tabBtn(true), padding: "12px 24px", marginTop: 12, opacity: prepLoading ? 0.6 : 1 }} onClick={genPrep} disabled={prepLoading}>{prepLoading ? "Preparing…" : "✦ Generate interview prep"}</button>
+
+            {prep && (
+              <div style={{ marginTop: 20 }}>
+                {prep.focusAreas?.length > 0 && (
+                  <div style={{ background: P.warnSoft, border: `1px solid #f0d5a0`, borderRadius: 12, padding: "10px 12px", fontSize: 13, marginBottom: 16, color: P.warn }}>
+                    <strong>Brush up before the interview:</strong> {prep.focusAreas.join(" · ")}
+                  </div>
+                )}
+                {prep.technical?.length > 0 && (
+                  <div style={{ marginBottom: 18 }}>
+                    <SectionLabel>Technical questions</SectionLabel>
+                    {prep.technical.map((qa, i) => <QA key={i} q={qa.q} a={qa.a} />)}
+                  </div>
+                )}
+                {prep.behavioral?.length > 0 && (
+                  <div style={{ marginBottom: 18 }}>
+                    <SectionLabel>Behavioral questions</SectionLabel>
+                    {prep.behavioral.map((qa, i) => <QA key={i} q={qa.q} a={qa.a} />)}
+                  </div>
+                )}
+                {prep.askThem?.length > 0 && (
+                  <div>
+                    <SectionLabel>Smart questions to ask them</SectionLabel>
+                    <ul style={{ margin: 0, paddingLeft: 18, fontSize: 13, lineHeight: 1.7 }}>{prep.askThem.map((q, i) => <li key={i}>{q}</li>)}</ul>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
         {tab === "history" && (
           <div style={glassCard}>
             <SectionLabel>Your generated resumes</SectionLabel>
@@ -471,6 +546,17 @@ function fileToBase64(file) { return new Promise((res, rej) => { const rd = new 
 function deriveLabel(jd) { const f = (jd || "").split("\n").find((l) => l.trim().length > 3); return (f || "Untitled job").trim().slice(0, 60); }
 function Row({ children }) { return <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>{children}</div>; }
 function SectionLabel({ children }) { return <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.6, textTransform: "uppercase", color: P.accentDeep, margin: "14px 0 8px" }}>{children}</div>; }
+function QA({ q, a }) {
+  const [open, setOpen] = React.useState(false);
+  return (
+    <div style={{ border: `1px solid ${P.glassBorder}`, borderRadius: 12, marginBottom: 8, background: "rgba(255,255,255,0.04)", overflow: "hidden" }}>
+      <button onClick={() => setOpen((o) => !o)} style={{ width: "100%", textAlign: "left", padding: "11px 14px", background: "transparent", border: "none", color: P.ink, fontSize: 13.5, fontWeight: 600, fontFamily: font, cursor: "pointer", display: "flex", justifyContent: "space-between", gap: 10 }}>
+        <span>{q}</span><span style={{ color: P.accent, flexShrink: 0 }}>{open ? "−" : "+"}</span>
+      </button>
+      {open && <div style={{ padding: "0 14px 12px", fontSize: 13, lineHeight: 1.65, color: P.muted, whiteSpace: "pre-wrap" }}>{a}</div>}
+    </div>
+  );
+}
 function Spinner() { return <span style={{ width: 13, height: 13, border: `2px solid rgba(109,78,201,0.25)`, borderTopColor: P.accent, borderRadius: "50%", display: "inline-block", animation: "spin 0.7s linear infinite" }}><style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style></span>; }
 
 function renderResumeInner(r) {
