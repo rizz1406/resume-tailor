@@ -1,20 +1,33 @@
 import React, { useState, useRef, useEffect } from "react";
-import html2pdf from "html2pdf.js";
-
+ 
 // ─── Persistence (localStorage) ─────────────────────────────────────────────
 const LS_KEY = "resumeTailor.apiKey";
-const LS_PROFILE = "resumeTailor.myProfile";   // the user's own saved profile
+const LS_PROFILE = "resumeTailor.myProfile";     // legacy single profile (migrated)
+const LS_PROFILES = "resumeTailor.profiles";     // { id: {name,...profile fields, _label} }
+const LS_ACTIVE = "resumeTailor.activeProfile";  // id of the currently selected profile
 const LS_HISTORY = "resumeTailor.history";
 const loadLS = (k, fb) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : fb; } catch { return fb; } };
 const saveLS = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-
+ 
 const DEFAULT_PROFILE = {
   name: "", title: "", email: "", phone: "", location: "",
   linkedin: "", github: "", website: "",
   skills: "", experience: "", projects: "", education: "", certifications: "",
 };
-
+ 
+// Load the named-profile collection, migrating any legacy single profile on first run.
+function loadProfiles() {
+  const existing = loadLS(LS_PROFILES, null);
+  if (existing && Object.keys(existing).length) return existing;
+  const legacy = loadLS(LS_PROFILE, null);
+  const id = uid();
+  const seed = legacy && (legacy.name || legacy.experience)
+    ? { [id]: { ...DEFAULT_PROFILE, ...legacy, _label: legacy.title || "My profile" } }
+    : { [id]: { ...DEFAULT_PROFILE, _label: "My profile" } };
+  return seed;
+}
+ 
 // ─── LaTeX (with per-item links) ─────────────────────────────────────────────
 function esc(s = "") {
   return String(s)
@@ -24,7 +37,7 @@ function esc(s = "") {
     .replace(/~/g, "\\textasciitilde{}").replace(/\^/g, "\\textasciicircum{}");
 }
 const urlize = (u = "") => (u.startsWith("http") ? u : "https://" + u);
-
+ 
 function buildLatex(r) {
   const contactBits = [
     r.email && `\\href{mailto:${esc(r.email)}}{${esc(r.email)}}`,
@@ -57,6 +70,8 @@ function buildLatex(r) {
 \\usepackage[margin=0.65in]{geometry}
 \\usepackage{enumitem}
 \\usepackage[hidelinks]{hyperref}
+\\input{glyphtounicode}
+\\pdfgentounicode=1
 \\pagestyle{empty}
 \\renewcommand{\\section}[1]{\\vspace{6pt}\\noindent\\textbf{\\large #1}\\vspace{2pt}\\hrule\\vspace{4pt}}
 \\setlength{\\parindent}{0pt}
@@ -75,42 +90,105 @@ ${eduBody ? `\\section{Education}\n${eduBody}\n` : ""}
 ${certBody ? `\\section{Certifications}\n${certBody}\n` : ""}
 \\end{document}`;
 }
-
+ 
 // ─── Gemini ──────────────────────────────────────────────────────────────────
-const GEMINI_MODEL = "gemini-3.5-flash";
-const geminiURL = (key) => `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(key)}`;
-async function geminiCall(key, parts) {
-  const res = await fetch(geminiURL(key), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ contents: [{ role: "user", parts }] }) });
-  if (!res.ok) {
-    const t = await res.text();
-    if (res.status === 400 && /API key not valid/i.test(t)) throw new Error("Invalid API key.");
-    if (res.status === 404) throw new Error("Model unavailable — Google may have retired it. Update GEMINI_MODEL.");
-    if (res.status === 429) throw new Error("Rate limit reached — wait a minute and retry.");
-    throw new Error(`Gemini error ${res.status}: ${t.slice(0, 120)}`);
+const GEMINI_MODEL = "gemini-3.6-flash";
+const geminiURL = () => `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+async function geminiCall(key, parts, generationConfig) {
+  const body = { contents: [{ role: "user", parts }] };
+  if (generationConfig) body.generationConfig = generationConfig;
+  const maxAttempts = 4;
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 60000);
+    let res;
+    try {
+      res = await fetch(geminiURL(), {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      if (e.name === "AbortError") throw new Error("Request timed out — try again.");
+      lastErr = new Error("Network error — check your connection and retry.");
+      if (attempt < maxAttempts) { await new Promise((r) => setTimeout(r, 800 * attempt)); continue; }
+      throw lastErr;
+    }
+    clearTimeout(timer);
+    if (!res.ok) {
+      const t = await res.text();
+      if (res.status === 400 && /API key not valid/i.test(t)) throw new Error("Invalid API key.");
+      if (res.status === 404) throw new Error("Model unavailable — Google may have retired it. Update GEMINI_MODEL.");
+      // Transient — Google overloaded or rate-limiting. Back off and retry.
+      if ((res.status === 503 || res.status === 429 || res.status === 500) && attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 1200 * attempt)); // 1.2s, 2.4s, 3.6s
+        continue;
+      }
+      if (res.status === 503) throw new Error("Gemini is overloaded right now (Google's side). Wait a moment and try again.");
+      if (res.status === 429) throw new Error("Rate limit reached — wait a minute and retry.");
+      throw new Error(`Gemini error ${res.status}: ${t.slice(0, 120)}`);
+    }
+    const data = await res.json();
+    const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
+    if (!text) throw new Error("Empty response from Gemini.");
+    return text;
   }
-  const data = await res.json();
-  const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
-  if (!text) throw new Error("Empty response from Gemini.");
-  return text;
+  throw lastErr || new Error("Gemini request failed after retries.");
 }
 const stripJson = (t) => t.replace(/```json/gi, "").replace(/```/g, "").trim();
-
+function safeParse(t, ctx) {
+  try { return JSON.parse(stripJson(t)); }
+  catch { throw new Error(`${ctx}: the AI returned invalid JSON. Try again.`); }
+}
+// Minimal-thinking + JSON mode for cheap, fast, parseable extraction calls.
+const JSON_CFG = { responseMimeType: "application/json" };
+const FAST_JSON_CFG = { responseMimeType: "application/json", thinkingConfig: { thinkingLevel: "minimal" } };
+const FAST_CFG = { thinkingConfig: { thinkingLevel: "minimal" } };
+ 
 async function extractJDFromImage(key, base64, mimeType) {
-  return geminiCall(key, [{ inline_data: { mime_type: mimeType, data: base64 } }, { text: "Extract the full job description text from this screenshot. Return only the raw text, no commentary." }]);
+  return geminiCall(key, [{ inline_data: { mime_type: mimeType, data: base64 } }, { text: "Extract the full job description text from this screenshot. Return only the raw text, no commentary." }], FAST_CFG);
+}
+async function extractJDFromImages(key, images) {
+  // images: [{ data, mimeType }] — multiple screenshots of ONE posting (scrolled).
+  const parts = images.map((img) => ({ inline_data: { mime_type: img.mimeType, data: img.data } }));
+  parts.push({ text: `These ${images.length} screenshots are parts of ONE job posting, in order (e.g. a long page scrolled top to bottom). Stitch them into a single continuous job description. Remove duplicated/overlapping text where the screenshots overlap. Return only the raw job description text, no commentary.` });
+  return geminiCall(key, parts, FAST_CFG);
 }
 async function parseResumeToProfile(key, text) {
   const prompt = `Extract this resume text into a structured profile. Copy contact details (name, email, phone, links) EXACTLY as they appear in the text — never reformat, complete, or "professionalize" an email or any contact field. If a field is absent, leave it as an empty string. Return ONLY valid JSON (no markdown):
 {"name":"","title":"","email":"","phone":"","location":"","linkedin":"","github":"","website":"","skills":"comma separated","experience":"free text of roles/companies/dates/bullets","projects":"free text","education":"free text","certifications":"comma separated"}
-
+ 
 RESUME TEXT:
 ${text}`;
-  return JSON.parse(stripJson(await geminiCall(key, [{ text: prompt }])));
+  return safeParse(await geminiCall(key, [{ text: prompt }], FAST_JSON_CFG), "Resume parsing");
 }
-async function tailorResume(key, profile, jd) {
-  const prompt = `You are an expert ATS resume writer. Given a candidate's raw profile and a target job description, produce a tailored, ATS-friendly resume. Rewrite experience/project bullets to emphasize achievements and keywords relevant to the job (strong action verbs, quantify only where the source supports it — NEVER fabricate metrics, companies, dates, or skills). Reorder skills so the most job-relevant come first. Stay strictly truthful.
-
+async function tailorResume(key, profile, jd, customPrompt = "") {
+  const prompt = `You are an expert ATS resume writer. Given a candidate's raw profile and a target job description, produce a tailored, ATS-friendly resume. Rewrite experience/project bullets to emphasize achievements and keywords relevant to the job (strong action verbs). Reorder skills so the most job-relevant come first.
+ 
+TRUTHFULNESS LOCK (absolute — this resume is for a REAL job application the candidate will be interviewed on):
+- You may ONLY rephrase, reorder, condense, and re-emphasize information that is present in the candidate profile below. 
+- NEVER add a skill, tool, technology, employer, title, date, degree, certification, project, or metric that is not explicitly in the profile.
+- NEVER invent or inflate numbers. Keep a metric ONLY if the profile states it. Do not turn "improved performance" into "improved performance by 30%".
+- If a job keyword is missing from the candidate's background, LEAVE IT MISSING — list it in keywordsMissing, do not slip it into a bullet.
+- If you are ever unsure whether something is grounded, leave it out and note it in fabricationWarnings.
+- Every single bullet in the output must be defensible in an interview using only the source profile.
+ 
+HARD CONSTRAINTS (must obey):
+- ONE PAGE ONLY. The final resume MUST fit on a single US-letter page at 11pt. Be ruthless: keep the summary to 2 lines, cap each role at 3-4 bullets, drop the least-relevant roles/projects entirely if needed, and keep bullets to roughly one line each. Prefer fewer, stronger, high-impact bullets over completeness.
+- Plain ATS-safe content only: no tables, no columns, no graphics, standard section names.
+- Prioritize strictly by relevance to the job description; cut anything that doesn't earn its space.
+ 
 For projects and certifications, if the source profile contains a URL for an item, put it in the "link" field; otherwise leave "link" empty.
-
+ 
+GAP ANALYSIS RULES (help the candidate win WITHOUT lying):
+- 'adjacent' means the candidate has genuinely related real experience. The honestBridge must name the REAL thing they did (e.g. "built Looker Studio dashboards" as a bridge to "data visualization") — it must NEVER claim the missing tool itself. Do not put the missing tool on the resume unless the profile already supports it.
+- 'learnable' is for real skills the candidate lacks but could plausibly gain a defensible beginner level in a few days — suggest the concrete step. Do NOT add these to the resume; they're for the candidate to actually go learn.
+- 'genuine-gap' is for anything that can't be honestly bridged. Be honest that it's a gap.
+- The resume itself must STILL obey the truthfulness lock — gapAnalysis is advice to the candidate, not license to add unsupported claims to the resume.
+${customPrompt.trim() ? `\nUSER'S CUSTOM INSTRUCTIONS (follow where possible, but the TRUTHFULNESS LOCK and one-page rule ALWAYS win — if an instruction asks you to add something not in the profile, refuse it and note it in fabricationWarnings):\n${customPrompt.trim()}\n` : ""}
 Return ONLY valid JSON (no markdown):
 {
   "summary": "2-3 line summary tailored to the job",
@@ -122,16 +200,39 @@ Return ONLY valid JSON (no markdown):
   "keywordsMatched": ["keywords reflected"],
   "keywordsMissing": ["important job keywords NOT in the background"],
   "matchScore": 0-100 integer,
+  "scoreBreakdown": {"keywordMatch": 0-100, "experienceRelevance": 0-100, "seniorityFit": 0-100},
+  "scoreRationale": "2-3 sentences explaining WHY this score — what pulled it up and what held it back",
+  "improvements": ["specific, actionable steps to raise the score, ranked highest-impact first — e.g. 'Add a bullet showing Tableau or Power BI dashboard work', 'Quantify the pipeline cost savings with a %'"],
   "fabricationWarnings": ["claims not grounded in the profile — empty if none"],
-  "notes": "1-2 sentences on what you emphasized"
+  "notes": "1-2 sentences on what you emphasized",
+  "matchVerdict": "one of: 'strong', 'moderate', 'weak'. Judge OVERALL realistic chance of getting an interview, weighting technical/skills fit heavily. Do NOT let a years-of-experience gap alone force 'weak': many postings list X years but hire strong candidates with less. Reserve 'weak' for when core technical skills or the domain don't match, or the seniority gap is very large (e.g. a new grad vs a lead/manager role). A candidate with strong technical fit but slightly junior years is usually 'moderate'.",
+  "matchVerdictReason": "1-2 plain, encouraging-but-honest sentences on the realistic odds and what mainly drives them",
+  "gapAnalysis": [
+    {
+      "keyword": "a specific skill/tool the JD wants that is NOT solidly in the profile",
+      "status": "one of: 'adjacent' (candidate has closely related real experience they can honestly frame), 'learnable' (could gain a real beginner competency quickly before applying), 'genuine-gap' (no honest bridge — do not claim it)",
+      "honestBridge": "for 'adjacent': the TRUTHFUL way to surface this using real profile experience, naming the real thing they did — NEVER claim the tool itself if unused. For 'learnable': the fastest concrete way to get a real, defensible beginner competency (specific resource/project, ~a few days). For 'genuine-gap': empty string.",
+      "resumeRelevant": true/false
+    }
+  ]
 }
-
+ 
 CANDIDATE PROFILE (raw):
 ${JSON.stringify(profile, null, 2)}
-
+ 
 TARGET JOB DESCRIPTION:
 ${jd}`;
-  return JSON.parse(stripJson(await geminiCall(key, [{ text: prompt }])));
+  return safeParse(await geminiCall(key, [{ text: prompt }], JSON_CFG), "Resume tailoring");
+}
+async function classifyJD(key, text) {
+  const prompt = `Decide whether the following text is a JOB DESCRIPTION / job posting (a specific role an employer is hiring for, with responsibilities, requirements, or qualifications).
+ 
+Return ONLY valid JSON (no markdown):
+{"isJobDescription": true or false, "whatItIs": "if NOT a job description, 3-8 words naming what it actually is (e.g. 'an article about ATS resumes', 'a resume', 'a cover letter', 'random notes'). If it IS a job description, empty string."}
+ 
+TEXT:
+${text.slice(0, 4000)}`;
+  return safeParse(await geminiCall(key, [{ text: prompt }], FAST_JSON_CFG), "JD check");
 }
 async function writeCoverLetter(key, profile, jd, result) {
   const prompt = `Write a concise professional cover letter (3 short paragraphs, ~200 words) for this candidate applying to this job. Warm but not flowery. Reference 2-3 real achievements from the profile that match the job. Invent nothing. Start "Dear Hiring Manager," if no name known; sign off with the candidate's name. Return ONLY the letter text.
@@ -140,10 +241,10 @@ HIGHLIGHTS: ${JSON.stringify(result?.notes || "")}
 JOB: ${jd}`;
   return geminiCall(key, [{ text: prompt }]);
 }
-
+ 
 async function makeInterviewPrep(key, profile, jd) {
   const prompt = `You are an interview coach. Using the candidate's profile and the target job description, produce realistic interview prep. Ground behavioral answers in the candidate's REAL experience — never invent projects, employers, or metrics. Keep answers tight and usable.
-
+ 
 Return ONLY valid JSON (no markdown):
 {
   "technical": [ {"q":"a technical question likely for this role","a":"a concise model answer / what a strong answer covers, tailored to the candidate's stack"} ],
@@ -152,15 +253,15 @@ Return ONLY valid JSON (no markdown):
   "focusAreas": ["skills or topics from the JD the candidate should brush up on before the interview"]
 }
 Aim for 5-6 technical, 4-5 behavioral, 3-4 askThem, 3-4 focusAreas.
-
+ 
 CANDIDATE PROFILE:
 ${JSON.stringify(profile, null, 2)}
-
+ 
 TARGET JOB DESCRIPTION:
 ${jd}`;
-  return JSON.parse(stripJson(await geminiCall(key, [{ text: prompt }])));
+  return safeParse(await geminiCall(key, [{ text: prompt }], JSON_CFG), "Interview prep");
 }
-
+ 
 // ─── Theme: soft liquid-glass on a rich dark purple base ─────────────────────
 const P = {
   ink: "#f2eefc", muted: "#b6acd6", faint: "#8b81ad",
@@ -172,7 +273,7 @@ const P = {
   field: "rgba(255,255,255,0.06)", fieldBorder: "rgba(255,255,255,0.16)",
 };
 const font = "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
-
+ 
 // Background options for the toggle. Photos are stable Unsplash CDN URLs (free, no key).
 // "gradient" always works offline as a fallback.
 const BACKGROUNDS = [
@@ -187,7 +288,7 @@ const glassCard = {
   border: "2px solid rgba(255,255,255,0.15)", borderRadius: 20, padding: 24,
   boxShadow: "0 10px 40px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.14)",
 };
-
+ 
 function Field({ label, value, onChange, placeholder, area, rows = 3, half, type = "text" }) {
   const shared = { width: "100%", marginTop: 5, padding: "9px 11px", fontSize: 13, fontFamily: font, border: `1px solid ${P.fieldBorder}`, borderRadius: 11, background: P.field, boxSizing: "border-box", color: P.ink, outline: "none" };
   return (
@@ -199,15 +300,21 @@ function Field({ label, value, onChange, placeholder, area, rows = 3, half, type
     </label>
   );
 }
-
+ 
 export default function App() {
   const [tab, setTab] = useState("profile");
   const [apiKey, setApiKey] = useState(() => loadLS(LS_KEY, ""));
   const [showKey, setShowKey] = useState(false);
-  const [myProfile, setMyProfile] = useState(() => loadLS(LS_PROFILE, DEFAULT_PROFILE));
+  const [profiles, setProfiles] = useState(() => loadProfiles());
+  const [activeId, setActiveId] = useState(() => {
+    const saved = loadLS(LS_ACTIVE, null);
+    const all = loadProfiles();
+    return saved && all[saved] ? saved : Object.keys(all)[0];
+  });
   const [mode, setMode] = useState("me"); // "me" | "other"
   const [otherProfile, setOtherProfile] = useState(DEFAULT_PROFILE);
   const [jd, setJd] = useState("");
+  const [customPrompt, setCustomPrompt] = useState("");
   const [jobLabel, setJobLabel] = useState("");
   const [jdImgName, setJdImgName] = useState("");
   const [status, setStatus] = useState("");
@@ -221,6 +328,7 @@ export default function App() {
   const [prep, setPrep] = useState(null);
   const [prepLoading, setPrepLoading] = useState(false);
   const [prepJd, setPrepJd] = useState("");
+  const [pageOverflow, setPageOverflow] = useState(false);
   const [bgId, setBgId] = useState(() => loadLS("resumeTailor.bg", "forest"));
   useEffect(() => saveLS("resumeTailor.bg", bgId), [bgId]);
   const bg = BACKGROUNDS.find((b) => b.id === bgId) || BACKGROUNDS[0];
@@ -228,33 +336,85 @@ export default function App() {
   const jdFileRef = useRef();
   const resumeFileRef = useRef();
   const previewRef = useRef();
-
+ 
   useEffect(() => saveLS(LS_KEY, apiKey), [apiKey]);
-  useEffect(() => saveLS(LS_PROFILE, myProfile), [myProfile]);
+  useEffect(() => saveLS(LS_PROFILES, profiles), [profiles]);
+  useEffect(() => saveLS(LS_ACTIVE, activeId), [activeId]);
   useEffect(() => saveLS(LS_HISTORY, history), [history]);
-
-  const profile = mode === "me" ? myProfile : otherProfile;
+ 
+  // One-page check: a US-letter page minus ~1in margins ≈ 9.5in of content.
+  // At 96dpi that's ~912px. The preview padding is 30px top+bottom (60px).
+  useEffect(() => {
+    if (!result || !previewRef.current) { setPageOverflow(false); return; }
+    const id = setTimeout(() => {
+      const h = previewRef.current?.scrollHeight || 0;
+      setPageOverflow(h > 60 + 912); // content taller than one printable page
+    }, 60);
+    return () => clearTimeout(id);
+  }, [result]);
+ 
+  const activeProfile = profiles[activeId] || { ...DEFAULT_PROFILE, _label: "My profile" };
+  const profile = mode === "me" ? activeProfile : otherProfile;
   const setProfileField = (k) => (v) => {
-    if (mode === "me") setMyProfile((p) => ({ ...p, [k]: v }));
+    if (mode === "me") setProfiles((all) => ({ ...all, [activeId]: { ...all[activeId], [k]: v } }));
     else setOtherProfile((p) => ({ ...p, [k]: v }));
   };
+  const setActiveProfileFull = (obj) => setProfiles((all) => ({ ...all, [activeId]: { ...all[activeId], ...obj } }));
+  function addProfile() {
+    const label = window.prompt("Name this profile (e.g. \"Data Analyst\", \"Data Engineer\"):", "");
+    if (label == null) return;
+    const id = uid();
+    setProfiles((all) => ({ ...all, [id]: { ...DEFAULT_PROFILE, _label: label.trim() || "Untitled" } }));
+    setActiveId(id);
+    setStatus(`Created profile "${label.trim() || "Untitled"}". Fill it in and Save.`);
+  }
+  function renameProfile() {
+    const label = window.prompt("Rename this profile:", activeProfile._label || "");
+    if (label == null) return;
+    setProfiles((all) => ({ ...all, [activeId]: { ...all[activeId], _label: label.trim() || "Untitled" } }));
+  }
+  function duplicateProfile() {
+    const id = uid();
+    const copy = { ...activeProfile, _label: (activeProfile._label || "Profile") + " (copy)" };
+    setProfiles((all) => ({ ...all, [id]: copy }));
+    setActiveId(id);
+    setStatus("Duplicated — a good way to make a variant for a different role type.");
+  }
+  function deleteProfile() {
+    const ids = Object.keys(profiles);
+    if (ids.length <= 1) { setStatus("Can't delete your only profile."); return; }
+    if (!window.confirm(`Delete profile "${activeProfile._label}"? This can't be undone.`)) return;
+    setProfiles((all) => { const n = { ...all }; delete n[activeId]; return n; });
+    setActiveId(ids.find((i) => i !== activeId));
+  }
   const profileFilled = profile.name && profile.experience && profile.email;
   const hasKey = apiKey.trim().length > 10;
-
+ 
   async function handleJDImage(e) {
-    const file = e.target.files?.[0]; if (!file) return;
+    const files = Array.from(e.target.files || []); if (!files.length) return;
     if (!hasKey) { setStatus("Add your free Gemini API key first."); return; }
-    setJdImgName(file.name); setStatus("Reading screenshot…"); setLoading(true);
+    setJdImgName(files.length === 1 ? files[0].name : `${files.length} screenshots`);
+    setStatus(files.length === 1 ? "Reading screenshot…" : `Reading & stitching ${files.length} screenshots…`);
+    setLoading(true);
     try {
-      const base64 = await fileToBase64(file);
-      setJd(await extractJDFromImage(apiKey, base64, file.type || "image/png"));
-      setStatus("Extracted job description. Review below, then generate.");
-    } catch (err) { setStatus("Couldn't read image: " + err.message); }
-    finally { setLoading(false); }
+      const images = await Promise.all(files.map(async (f) => ({ data: await fileToBase64(f), mimeType: f.type || "image/png" })));
+      const text = images.length === 1
+        ? await extractJDFromImage(apiKey, images[0].data, images[0].mimeType)
+        : await extractJDFromImages(apiKey, images);
+      setJd(text);
+      setStatus(files.length === 1 ? "Extracted job description. Review below, then generate." : `Stitched ${files.length} screenshots into one job description. Review below.`);
+    } catch (err) { setStatus("Couldn't read image(s): " + err.message); }
+    finally { setLoading(false); e.target.value = ""; }
   }
   async function handleResumeUpload(e) {
     const file = e.target.files?.[0]; if (!file) return;
     if (!hasKey) { setStatus("Add your Gemini API key first."); return; }
+    // Protect a curated master profile from being silently wiped by an upload.
+    if (mode === "me" && (activeProfile.experience?.trim() || activeProfile.skills?.trim())) {
+      if (!window.confirm("This will replace your saved profile with the parsed resume. Your current profile will be overwritten. Continue?")) {
+        e.target.value = ""; return;
+      }
+    }
     setStatus("Reading your resume…"); setLoading(true);
     try {
       let parsed;
@@ -264,30 +424,43 @@ export default function App() {
         parsed = await parseResumeToProfile(apiKey, text);
       } else if (file.type === "application/pdf") {
         const base64 = await fileToBase64(file);
-        const raw = await geminiCall(apiKey, [{ inline_data: { mime_type: "application/pdf", data: base64 } }, { text: "Extract all text from this resume PDF, raw text only." }]);
+        const raw = await geminiCall(apiKey, [{ inline_data: { mime_type: "application/pdf", data: base64 } }, { text: "Extract all text from this resume PDF, raw text only." }], FAST_CFG);
         parsed = await parseResumeToProfile(apiKey, raw);
       } else {
         const text = await file.text();
         parsed = await parseResumeToProfile(apiKey, text);
       }
       const cleaned = { ...DEFAULT_PROFILE, ...parsed };
-      if (mode === "me") setMyProfile(cleaned); else setOtherProfile(cleaned);
+      if (mode === "me") setActiveProfileFull(cleaned); else setOtherProfile(cleaned);
       setStatus("Filled from your resume — review the fields, tweak anything, then add a job.");
     } catch (err) { setStatus("Couldn't parse resume: " + err.message); }
     finally { setLoading(false); }
   }
-
+ 
   async function generate() {
     if (!hasKey) { setStatus("Add your free Gemini API key first."); return; }
     if (!profileFilled) { setTab("profile"); setStatus("Fill in at least name, email, and experience."); return; }
     if (!jd.trim()) { setStatus("Add a job description."); return; }
-    setLoading(true); setStatus("Tailoring the resume…"); setCoverLetter("");
+    if (jd.trim().length < 120) {
+      if (!window.confirm("That job description looks quite short — the scores and gap analysis work best with the full posting. Generate anyway?")) return;
+    }
+    setLoading(true); setStatus("Checking the job description…"); setCoverLetter("");
     try {
-      const tailored = await tailorResume(apiKey, profile, jd);
+      const check = await classifyJD(apiKey, jd);
+      if (check && check.isJobDescription === false) {
+        setLoading(false);
+        setStatus(`That doesn't look like a job description — it looks like ${check.whatItIs || "something else"}. Paste the actual job posting (responsibilities, requirements, qualifications) and try again.`);
+        return;
+      }
+    } catch { /* if the check itself fails, don't block generation */ }
+    setStatus("Tailoring the resume… (retries automatically if Gemini is busy)");
+    try {
+      const tailored = await tailorResume(apiKey, profile, jd, customPrompt);
       const merged = { name: profile.name, title: profile.title, email: profile.email, phone: profile.phone, location: profile.location, linkedin: profile.linkedin, github: profile.github, website: profile.website, ...tailored };
+      merged.keywordCoverage = computeKeywordCoverage(merged, jd); // real, reproducible
       const t = buildLatex(merged);
       setResult(merged); setTex(t); setTab("result"); setStatus("Done — review, then download.");
-      setHistory((h) => [{ id: uid(), label: jobLabel || deriveLabel(jd), person: mode === "me" ? "Me" : (profile.name || "Someone else"), date: new Date().toISOString(), jd, result: merged, tex: t }, ...h].slice(0, 50));
+      setHistory((h) => [{ id: uid(), label: jobLabel || deriveLabel(jd), person: mode === "me" ? (activeProfile._label || "Me") : (profile.name || "Someone else"), date: new Date().toISOString(), jd, result: merged, tex: t }, ...h].slice(0, 50));
     } catch (err) { setStatus("Generation failed: " + err.message); }
     finally { setLoading(false); }
   }
@@ -313,15 +486,32 @@ export default function App() {
     const blob = new Blob([tex], { type: "text/plain" }); const url = URL.createObjectURL(blob);
     const a = document.createElement("a"); a.href = url; a.download = `${(result?.name || "resume").replace(/\s+/g, "_")}.tex`; a.click(); URL.revokeObjectURL(url);
   }
-  function downloadPdf() {
+  async function downloadPdf() {
     if (!previewRef.current) return; setStatus("Building PDF…");
-    html2pdf().set({ margin: [0.5, 0.55, 0.5, 0.55], filename: `${(result?.name || "resume").replace(/\s+/g, "_")}.pdf`, image: { type: "jpeg", quality: 0.98 }, html2canvas: { scale: 2, useCORS: true }, jsPDF: { unit: "in", format: "letter", orientation: "portrait" }, enableLinks: true }).from(previewRef.current).save().then(() => setStatus("PDF downloaded."));
+    try {
+      const { default: html2pdf } = await import("html2pdf.js");
+      await html2pdf().set({ margin: [0.5, 0.55, 0.5, 0.55], filename: `${(result?.name || "resume").replace(/\s+/g, "_")}.pdf`, image: { type: "jpeg", quality: 0.98 }, html2canvas: { scale: 2, useCORS: true }, jsPDF: { unit: "in", format: "letter", orientation: "portrait" }, enableLinks: true }).from(previewRef.current).save();
+      setStatus("PDF downloaded.");
+    } catch (err) { setStatus("PDF failed: " + err.message); }
   }
-
+ 
   const tabBtn = (active, extra = {}) => ({ padding: "7px 15px", fontSize: 13, fontWeight: 600, fontFamily: font, border: `1px solid ${active ? "transparent" : P.glassBorder}`, background: active ? "linear-gradient(135deg,#8b6bff,#a855f7)" : P.glassHi, color: active ? "#fff" : P.ink, borderRadius: 11, cursor: "pointer", backdropFilter: "blur(8px)", WebkitBackdropFilter: "blur(8px)", ...extra });
   const score = result?.matchScore;
-  const scoreColor = score >= 75 ? P.ok : score >= 50 ? P.warn : P.danger;
-
+  const scoreColor = score == null ? P.muted : score >= 75 ? P.ok : score >= 50 ? P.warn : P.danger;
+  // Coverage: prefer the deterministic count; if it can't run (JD text missing,
+  // or too few vocab hits), fall back to the AI's own matched/missing keyword
+  // lists so the user still gets a meaningful number.
+  const coverage = (() => {
+    if (!result) return null;
+    const det = result.keywordCoverage || computeKeywordCoverage(result, jd);
+    if (det) return det;
+    const m = result.keywordsMatched || [], mi = result.keywordsMissing || [];
+    if (m.length + mi.length >= 3) {
+      return { matched: m, missing: mi, pct: Math.round((m.length / (m.length + mi.length)) * 100), fromAI: true };
+    }
+    return null;
+  })();
+ 
   return (
     <div style={{ fontFamily: font, minHeight: "100vh", color: P.ink, position: "relative", overflow: "hidden", background: "#0f0a1e" }}>
       {/* Background layer — photo or gradient, with liquid refraction. */}
@@ -346,7 +536,7 @@ export default function App() {
           </div>
           <button onClick={cycleBg} title="Change background" style={{ ...tabBtn(false), whiteSpace: "nowrap" }}>🖼 {bg.label}</button>
         </div>
-
+ 
         <div style={{ ...glassCard, padding: "12px 16px", margin: "18px 0" }}>
           <div style={{ fontSize: 11.5, fontWeight: 700, color: P.accentDeep, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 7 }}>Gemini API key {hasKey ? "✓ saved" : "— required"}</div>
           <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
@@ -355,7 +545,7 @@ export default function App() {
             <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" style={{ ...tabBtn(false), textDecoration: "none" }}>Get a free key ↗</a>
           </div>
         </div>
-
+ 
         <div style={{ display: "flex", gap: 8, margin: "16px 0", flexWrap: "wrap" }}>
           <button style={tabBtn(tab === "profile")} onClick={() => setTab("profile")}>1 · Profile</button>
           <button style={tabBtn(tab === "job")} onClick={() => setTab("job")}>2 · Job</button>
@@ -363,31 +553,57 @@ export default function App() {
           <button style={tabBtn(tab === "prep")} onClick={() => setTab("prep")}>🎤 Interview prep</button>
           <button style={tabBtn(tab === "history")} onClick={() => setTab("history")}>History ({history.length})</button>
         </div>
-
+ 
         {status && <div style={{ ...glassCard, padding: "9px 14px", fontSize: 13, marginBottom: 16, display: "flex", alignItems: "center", gap: 8 }}>{loading && <Spinner />}{status}</div>}
-
+ 
         {tab === "profile" && (
           <div style={glassCard}>
-            <div style={{ display: "flex", gap: 6, marginBottom: 16, background: P.field, padding: 5, borderRadius: 13, width: "fit-content", border: `1px solid ${P.glassBorder}` }}>
-              <button onClick={() => setMode("me")} style={{ ...tabBtn(mode === "me"), border: "none" }}>This is me</button>
+            <div style={{ display: "flex", gap: 6, marginBottom: 14, background: P.field, padding: 5, borderRadius: 13, width: "fit-content", border: `1px solid ${P.glassBorder}` }}>
+              <button onClick={() => setMode("me")} style={{ ...tabBtn(mode === "me"), border: "none" }}>My profiles</button>
               <button onClick={() => setMode("other")} style={{ ...tabBtn(mode === "other"), border: "none" }}>Someone else</button>
             </div>
+ 
+            {mode === "me" && (
+              <div style={{ marginBottom: 14 }}>
+                <SectionLabel>Profile</SectionLabel>
+                <div style={{ fontSize: 12, color: P.muted, marginBottom: 8 }}>
+                  Keep separate master profiles for different role types (e.g. Data Analyst vs Data Engineer). Pick one to tailor from.
+                </div>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                  {Object.entries(profiles).map(([id, p]) => (
+                    <button key={id} onClick={() => setActiveId(id)}
+                      style={{ ...tabBtn(id === activeId), padding: "6px 14px", fontSize: 12.5 }}>
+                      {p._label || "Untitled"}
+                    </button>
+                  ))}
+                  <button onClick={addProfile} title="New profile" style={{ ...tabBtn(false), padding: "6px 12px", fontSize: 12.5 }}>+ New</button>
+                </div>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
+                  <button onClick={renameProfile} style={{ ...tabBtn(false), padding: "4px 11px", fontSize: 11.5 }}>Rename</button>
+                  <button onClick={duplicateProfile} style={{ ...tabBtn(false), padding: "4px 11px", fontSize: 11.5 }}>Duplicate</button>
+                  {Object.keys(profiles).length > 1 && (
+                    <button onClick={deleteProfile} style={{ ...tabBtn(false), padding: "4px 11px", fontSize: 11.5, color: P.danger }}>Delete</button>
+                  )}
+                </div>
+              </div>
+            )}
+ 
             <div style={{ fontSize: 12.5, color: P.muted, marginBottom: 16 }}>
               {mode === "me"
-                ? "Your saved profile. Fill it once (or auto-fill from a resume below) and hit Save — it loads automatically every visit."
-                : "A blank profile for making a resume for someone else. Your own saved profile stays untouched."}
+                ? `Editing "${activeProfile._label || "profile"}". Changes save automatically. Auto-fill from a resume below if you like.`
+                : "A blank profile for making a resume for someone else. Your own saved profiles stay untouched."}
             </div>
-
+ 
             <div style={{ display: "flex", gap: 8, marginBottom: 18, flexWrap: "wrap" }}>
               <button style={{ ...tabBtn(false), background: P.accentSoft, borderColor: "transparent", color: P.accentDeep }} onClick={() => resumeFileRef.current?.click()}>⬆ Auto-fill from an existing resume</button>
               {mode === "me" && (
-                <button style={{ ...tabBtn(false) }} onClick={() => { saveLS(LS_PROFILE, myProfile); setProfileSaved(true); setStatus("Profile saved — it'll load automatically next time."); setTimeout(() => setProfileSaved(false), 2500); }}>
-                  {profileSaved ? "✓ Saved" : "💾 Save my profile"}
+                <button style={{ ...tabBtn(false) }} onClick={() => { setProfiles((all) => ({ ...all })); setProfileSaved(true); setStatus("Saved. Your profiles load automatically every visit."); setTimeout(() => setProfileSaved(false), 2500); }}>
+                  {profileSaved ? "✓ Saved" : "💾 Save"}
                 </button>
               )}
               <input ref={resumeFileRef} type="file" accept=".pdf,.txt,.md,image/*" hidden onChange={handleResumeUpload} />
             </div>
-
+ 
             <SectionLabel>Contact</SectionLabel>
             <Row>
               <Field half label="Full name *" value={profile.name} onChange={setProfileField("name")} placeholder="Jane Doe" />
@@ -414,29 +630,135 @@ export default function App() {
             <button style={{ ...tabBtn(true), padding: "11px 22px", marginTop: 8 }} onClick={() => setTab("job")}>Next: add a job →</button>
           </div>
         )}
-
+ 
         {tab === "job" && (
           <div style={glassCard}>
             <Field label="Job label (optional — for your history)" value={jobLabel} onChange={setJobLabel} placeholder="e.g. Google — Data Engineer" />
             <SectionLabel>Upload a screenshot of the job posting</SectionLabel>
             <div onClick={() => jdFileRef.current?.click()} style={{ border: `2px dashed ${P.fieldBorder}`, borderRadius: 14, padding: 24, textAlign: "center", cursor: "pointer", background: P.field, marginBottom: 8 }}>
-              <div style={{ fontSize: 14, fontWeight: 600 }}>{jdImgName ? `📎 ${jdImgName}` : "Click to upload a screenshot"}</div>
-              <div style={{ fontSize: 12, color: P.muted, marginTop: 4 }}>PNG / JPG — the AI reads it automatically</div>
-              <input ref={jdFileRef} type="file" accept="image/*" hidden onChange={handleJDImage} />
+              <div style={{ fontSize: 14, fontWeight: 600 }}>{jdImgName ? `📎 ${jdImgName}` : "Click to upload screenshot(s)"}</div>
+              <div style={{ fontSize: 12, color: P.muted, marginTop: 4 }}>PNG / JPG — upload one, or several parts of a long posting (they'll be stitched in order)</div>
+              <input ref={jdFileRef} type="file" accept="image/*" multiple hidden onChange={handleJDImage} />
             </div>
             <div style={{ textAlign: "center", color: P.muted, fontSize: 12, margin: "10px 0" }}>— or —</div>
             <SectionLabel>Paste the job description</SectionLabel>
             <textarea value={jd} onChange={(e) => setJd(e.target.value)} rows={10} placeholder="Paste the full job description here…" style={{ width: "100%", padding: "11px 13px", fontSize: 13, fontFamily: font, border: `1px solid ${P.fieldBorder}`, borderRadius: 12, background: P.field, boxSizing: "border-box", resize: "vertical", color: P.ink, outline: "none" }} />
+            <SectionLabel>Custom instructions (optional — tell the AI what you want)</SectionLabel>
+            <textarea value={customPrompt} onChange={(e) => setCustomPrompt(e.target.value)} rows={3} placeholder="e.g. Emphasize my GCP + dbt work, downplay the retail job, lead with metrics, keep a data-engineering tone…" style={{ width: "100%", padding: "11px 13px", fontSize: 13, fontFamily: font, border: `1px solid ${P.fieldBorder}`, borderRadius: 12, background: P.field, boxSizing: "border-box", resize: "vertical", color: P.ink, outline: "none" }} />
             <button style={{ ...tabBtn(true), padding: "12px 24px", marginTop: 12, opacity: loading ? 0.6 : 1 }} onClick={generate} disabled={loading}>{loading ? "Working…" : "✦ Generate tailored resume"}</button>
           </div>
         )}
-
+ 
         {tab === "result" && result && (
           <div style={glassCard}>
+            {result.matchVerdict && (() => {
+              const v = result.matchVerdict;
+              const cfg = v === "strong"
+                ? { c: P.ok, bg: "rgba(47,125,87,0.15)", bd: "rgba(127,224,173,0.4)", label: "Strong match", sub: "Go for it — this one's worth your time." }
+                : v === "moderate"
+                ? { c: P.warn, bg: P.warnSoft, bd: "#f0d5a0", label: "Worth a shot", sub: "Decent fit. Apply if you like the role — just prep the gaps below." }
+                : { c: P.danger, bg: P.dangerSoft, bd: "rgba(255,155,138,0.4)", label: "Bit of a stretch", sub: "You can still apply, but similar roles at your level are a better bet for your time." };
+              return (
+                <div style={{ background: cfg.bg, border: `1px solid ${cfg.bd}`, borderRadius: 12, padding: "14px 16px", marginBottom: 16 }}>
+                  <div style={{ fontSize: 17, fontWeight: 800, color: cfg.c }}>{cfg.label}</div>
+                  <div style={{ fontSize: 12.5, color: P.ink, marginTop: 3, opacity: 0.85 }}>{cfg.sub}</div>
+                  {result.matchVerdictReason && <div style={{ fontSize: 12.5, color: P.muted, marginTop: 8, lineHeight: 1.5 }}>{result.matchVerdictReason}</div>}
+                </div>
+              );
+            })()}
+            {coverage && !coverage.fromAI && typeof result.scoreBreakdown?.keywordMatch === "number" && result.scoreBreakdown.keywordMatch - coverage.pct >= 40 && (
+              <div style={{ background: P.warnSoft, border: `1px solid #f0d5a0`, borderRadius: 12, padding: "10px 12px", fontSize: 12.5, marginBottom: 16, color: P.warn, lineHeight: 1.5 }}>
+                <strong>⚠ These two numbers disagree a lot.</strong> That usually means the "job description" you pasted wasn't a real posting (or was very short), so the measured keyword count isn't meaningful here. For accurate scores, paste the full job description on the Job tab and regenerate.
+              </div>
+            )}
             {typeof score === "number" && (
-              <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
-                <div style={{ width: 58, height: 58, borderRadius: "50%", border: `4px solid ${scoreColor}`, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 18, color: scoreColor }}>{score}</div>
-                <div><div style={{ fontSize: 13, fontWeight: 700 }}>ATS match score</div><div style={{ fontSize: 12, color: P.muted }}>{score >= 75 ? "Strong fit" : score >= 50 ? "Moderate — add missing keywords" : "Weak — may need more relevant experience"}</div></div>
+              <details style={{ marginBottom: 16, background: P.field, border: `1px solid ${P.glassBorder}`, borderRadius: 12, padding: "10px 13px" }}>
+                <summary style={{ cursor: "pointer", fontSize: 13, fontWeight: 600, color: P.ink, display: "flex", alignItems: "center", gap: 8 }}>
+                  <span>See the numbers behind this</span>
+                  <span style={{ fontSize: 11.5, fontWeight: 400, color: P.muted }}>AI fit {score} · keyword coverage {coverage ? coverage.pct + "%" : "—"}</span>
+                </summary>
+                <div style={{ marginTop: 12 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                      <div style={{ width: 52, height: 52, borderRadius: "50%", border: `4px solid ${scoreColor}`, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 17, color: scoreColor }}>{score}</div>
+                      <div>
+                        <div style={{ fontSize: 12.5, fontWeight: 700 }}>Overall fit (AI)</div>
+                        <div style={{ fontSize: 11, color: P.faint }}>a judgement call — rough guide, not exact</div>
+                      </div>
+                    </div>
+                    {coverage ? (
+                      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                        <div style={{ width: 52, height: 52, borderRadius: "50%", border: `4px solid ${coverage.pct >= 70 ? P.ok : coverage.pct >= 45 ? P.warn : P.danger}`, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 800, fontSize: 15, color: coverage.pct >= 70 ? P.ok : coverage.pct >= 45 ? P.warn : P.danger }}>{coverage.pct}%</div>
+                        <div>
+                          <div style={{ fontSize: 12.5, fontWeight: 700 }}>Job words your resume actually uses</div>
+                          <div style={{ fontSize: 11, color: P.faint }}>{coverage.matched.length} of {coverage.matched.length + coverage.missing.length} key terms · {coverage.fromAI ? "AI estimate" : "exact count"}</div>
+                        </div>
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: 11.5, color: P.faint, maxWidth: 260, lineHeight: 1.5 }}>
+                        Keyword coverage needs the job description text in the box on the Job tab. If you uploaded the JD as an image, the text may not have carried over — paste the JD text and regenerate to see this.
+                      </div>
+                    )}
+                  </div>
+                  {result.scoreBreakdown && (
+                    <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
+                      {[["Skills & tools overlap", result.scoreBreakdown.keywordMatch], ["How relevant your experience is", result.scoreBreakdown.experienceRelevance], ["Seniority level fit", result.scoreBreakdown.seniorityFit]].map(([label, val]) => typeof val === "number" && (
+                        <div key={label} style={{ flex: "1 1 150px", background: "rgba(255,255,255,0.04)", border: `1px solid ${P.glassBorder}`, borderRadius: 10, padding: "8px 11px" }}>
+                          <div style={{ fontSize: 11, color: P.muted }}>{label}</div>
+                          <div style={{ fontSize: 16, fontWeight: 700, color: val >= 75 ? P.ok : val >= 50 ? P.warn : P.danger }}>{val}</div>
+                          <div style={{ height: 4, background: "rgba(255,255,255,0.1)", borderRadius: 4, marginTop: 4, overflow: "hidden" }}><div style={{ height: "100%", width: `${val}%`, background: val >= 75 ? P.ok : val >= 50 ? P.warn : P.danger }} /></div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {result.scoreRationale && (
+                    <div style={{ fontSize: 12.5, color: P.muted, marginTop: 10, lineHeight: 1.55 }}><strong style={{ color: P.ink }}>The reasoning:</strong> {result.scoreRationale}</div>
+                  )}
+                </div>
+              </details>
+            )}
+            {result.improvements?.length > 0 && (
+              <div style={{ background: P.accentSoft, borderRadius: 12, padding: "11px 13px", marginBottom: 16 }}>
+                <div style={{ fontSize: 12.5, fontWeight: 700, color: P.accentDeep, marginBottom: 6 }}>What would make you a stronger candidate here</div>
+                <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12.5, lineHeight: 1.7 }}>{result.improvements.map((s, i) => <li key={i}>{s}</li>)}</ul>
+                <div style={{ fontSize: 11.5, color: P.faint, marginTop: 8 }}>Tip: paste any of these into Custom instructions on the Job tab, then regenerate.</div>
+              </div>
+            )}
+            {result.gapAnalysis?.length > 0 && (
+              <div style={{ marginBottom: 16 }}>
+                <SectionLabel>Bridging the gaps — honestly</SectionLabel>
+                <div style={{ fontSize: 12, color: P.muted, marginBottom: 10, lineHeight: 1.5 }}>
+                  Things the job asks for that aren't clearly in your profile yet — and the honest way to handle each. None of this is auto-added to your resume; you decide what's true for you.
+                </div>
+                {["adjacent", "learnable", "genuine-gap"].map((st) => {
+                  const items = result.gapAnalysis.filter((g) => g.status === st);
+                  if (!items.length) return null;
+                  const meta = st === "adjacent"
+                    ? { c: P.ok, title: "You've basically done this — just say it right", sub: "You have real, related experience. Frame it like this (don't claim the tool itself unless you've actually used it):" }
+                    : st === "learnable"
+                    ? { c: P.warn, title: "You could genuinely pick this up fast", sub: "Not yours yet, but a short focused effort gets you a real beginner level you can defend — then it's honestly yours:" }
+                    : { c: P.danger, title: "Real gaps — don't fake these", sub: "No honest bridge right now. Leave them off, but know they're the weak spots if you do apply:" };
+                  return (
+                    <div key={st} style={{ marginBottom: 12 }}>
+                      <div style={{ fontSize: 12.5, fontWeight: 700, color: meta.c, marginBottom: 4 }}>{meta.title}</div>
+                      <div style={{ fontSize: 11.5, color: P.faint, marginBottom: 8 }}>{meta.sub}</div>
+                      {items.map((g, i) => (
+                        <div key={i} style={{ border: `1px solid ${P.glassBorder}`, borderRadius: 10, padding: "9px 12px", marginBottom: 6, background: P.field }}>
+                          <div style={{ fontSize: 13, fontWeight: 600, color: P.ink }}>{g.keyword}</div>
+                          {g.honestBridge && <div style={{ fontSize: 12.5, color: P.muted, marginTop: 3, lineHeight: 1.5 }}>{g.honestBridge}</div>}
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })}
+                <div style={{ fontSize: 11.5, color: P.faint, marginTop: 4, lineHeight: 1.5 }}>
+                  If a bridge reflects something you genuinely did, add it to your profile on the Profile tab and regenerate — then it's real and it'll count.
+                </div>
+              </div>
+            )}
+            {pageOverflow && (
+              <div style={{ background: P.warnSoft, border: `1px solid #f0d5a0`, borderRadius: 12, padding: "10px 12px", fontSize: 13, marginBottom: 14, color: P.warn }}>
+                <strong>⚠ Slightly over one page.</strong> The content is a bit taller than a single letter page. Regenerate with a custom instruction like “cut to one page — drop the weakest bullet from each role,” or trim a project.
               </div>
             )}
             <div style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
@@ -477,7 +799,7 @@ export default function App() {
             </details>
           </div>
         )}
-
+ 
         {tab === "prep" && (
           <div style={glassCard}>
             <SectionLabel>🎤 Interview prep</SectionLabel>
@@ -488,7 +810,7 @@ export default function App() {
               placeholder={jd.trim() ? "Leave blank to reuse your last job description, or paste a different one here…" : "Paste the job description you're interviewing for…"}
               style={{ width: "100%", padding: "11px 13px", fontSize: 13, fontFamily: font, border: `1px solid ${P.fieldBorder}`, borderRadius: 12, background: P.field, boxSizing: "border-box", resize: "vertical", color: P.ink, outline: "none" }} />
             <button style={{ ...tabBtn(true), padding: "12px 24px", marginTop: 12, opacity: prepLoading ? 0.6 : 1 }} onClick={genPrep} disabled={prepLoading}>{prepLoading ? "Preparing…" : "✦ Generate interview prep"}</button>
-
+ 
             {prep && (
               <div style={{ marginTop: 20 }}>
                 {prep.focusAreas?.length > 0 && (
@@ -518,7 +840,7 @@ export default function App() {
             )}
           </div>
         )}
-
+ 
         {tab === "history" && (
           <div style={glassCard}>
             <SectionLabel>Your generated resumes</SectionLabel>
@@ -535,15 +857,91 @@ export default function App() {
               ))}
           </div>
         )}
-
+ 
         <p style={{ textAlign: "center", color: P.muted, fontSize: 11.5, marginTop: 30 }}>Your data stays in your browser except requests to Google's Gemini API. No server, no tracking.</p>
       </div>
     </div>
   );
 }
-
+ 
 function fileToBase64(file) { return new Promise((res, rej) => { const rd = new FileReader(); rd.onload = () => res(rd.result.split(",")[1]); rd.onerror = rej; rd.readAsDataURL(file); }); }
 function deriveLabel(jd) { const f = (jd || "").split("\n").find((l) => l.trim().length > 3); return (f || "Untitled job").trim().slice(0, 60); }
+ 
+// ─── Deterministic ATS keyword match (no AI — reproducible) ─────────────────
+// Flattens the tailored resume into plain text, then checks which of the
+// job's important keywords literally appear in it. This is a real, repeatable
+// number that sits next to the AI's fuzzy matchScore.
+const STOPWORDS = new Set("a an and are as at be by for from has have in is it its of on or that the to with will your you we our their they this these those must should can able strong excellent proven track record etc using use used work working experience years year role team teams ability across including etc".split(" "));
+function normalizeText(s) {
+  return (s || "").toLowerCase()
+    .replace(/[^a-z0-9+#.\s]/g, " ")   // keep + # . (c++, c#, node.js)
+    .replace(/\s+/g, " ");
+}
+function singularize(w) {
+  if (w.length > 4 && w.endsWith("ies")) return w.slice(0, -3) + "y"; // pipelines-style not affected; libraries->library
+  if (w.length > 3 && w.endsWith("es")) return w.slice(0, -2);        // processes->process
+  if (w.length > 3 && w.endsWith("s") && !w.endsWith("ss")) return w.slice(0, -1); // pipelines->pipeline
+  return w;
+}
+function resumeToPlainText(r) {
+  const parts = [r.summary, r.skills];
+  (r.experienceStructured || []).forEach((e) => { parts.push(e.role, e.company, ...(e.bullets || [])); });
+  (r.projectsStructured || []).forEach((p) => { parts.push(p.name, p.tech, ...(p.bullets || [])); });
+  (r.educationStructured || []).forEach((e) => { parts.push(e.degree, e.school); });
+  (r.certificationsStructured || []).forEach((c) => parts.push(c.name));
+  // normalized text + a "despaced" copy so "Power BI" matches "powerbi"
+  const norm = normalizeText(parts.filter(Boolean).join(" "));
+  return { norm, despaced: norm.replace(/\s+/g, "") };
+}
+// A curated vocabulary of skills/tools/technologies that actually matter for
+// ATS keyword matching. Frequency-ranking picks JD boilerplate ("passionate",
+// "stakeholder") instead of real skills, so we match against this list plus
+// multi-word tech phrases detected in the JD.
+const SKILL_VOCAB = [
+  "sql","python","r","java","scala","javascript","typescript","bash","c++","c#","go","rust",
+  "bigquery","snowflake","redshift","databricks","postgres","postgresql","mysql","mongodb","cassandra","oracle","sqlite",
+  "dbt","airflow","dagster","prefect","luigi","spark","hadoop","kafka","flink","beam","hive","presto","trino",
+  "etl","elt","pipeline","warehouse","warehousing","lakehouse","data lake","data modeling","data modelling",
+  "gcp","aws","azure","cloud run","cloud functions","lambda","s3","gcs","ec2","bigtable","pub/sub","dataflow","dataproc","glue","athena","emr","kinesis",
+  "tableau","power bi","powerbi","looker","looker studio","data studio","qlik","superset","metabase","grafana",
+  "ga4","google analytics","google ad manager","gam","marfeel","parse.ly","segment","mixpanel","amplitude",
+  "pandas","numpy","scipy","scikit-learn","sklearn","statsmodels","tensorflow","pytorch","keras","xgboost",
+  "machine learning","statistics","statistical analysis","hypothesis testing","regression","forecasting","a/b testing","ab testing","experimentation",
+  "docker","kubernetes","terraform","ci/cd","git","github","gitlab","jenkins","cloud scheduler",
+  "excel","vba","google sheets","dax","m query","power query",
+  "api","rest","graphql","json","yaml","etl pipeline","data quality","data governance","dashboard","reporting","visualization","visualisation",
+  "partitioning","clustering","incremental","microbatch","orchestration","automation","monitoring","alerting",
+];
+function extractJdKeywords(jd) {
+  const norm = normalizeText(jd);
+  const despaced = norm.replace(/\s+/g, "");
+  const found = new Set();
+  for (const skill of SKILL_VOCAB) {
+    const s = skill.toLowerCase();
+    // multi-word (has space or is a known despaced form) → substring; single word → token boundary
+    if (s.includes(" ") || s.includes("/") || s.includes(".") || s.includes("+") || s.includes("#") || s.includes("-")) {
+      if (norm.includes(s) || despaced.includes(s.replace(/\s+/g, ""))) found.add(skill);
+    } else {
+      const re = new RegExp(`(^|\\s)${s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(s|es)?(\\s|$)`);
+      if (re.test(norm)) found.add(skill);
+    }
+  }
+  return [...found];
+}
+function computeKeywordCoverage(resume, jd) {
+  const { norm, despaced } = resumeToPlainText(resume);
+  const kws = extractJdKeywords(jd);
+  if (kws.length < 3) return null; // too few real skills detected to be meaningful
+  const matched = [], missing = [];
+  for (const k of kws) {
+    const s = k.toLowerCase();
+    const hit = s.includes(" ") || s.includes("/") || s.includes(".") || s.includes("+") || s.includes("#") || s.includes("-")
+      ? (norm.includes(s) || despaced.includes(s.replace(/\s+/g, "")))
+      : new RegExp(`(^|\\s)${s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(s|es)?(\\s|$)`).test(norm);
+    (hit ? matched : missing).push(k);
+  }
+  return { matched, missing, pct: Math.round((matched.length / kws.length) * 100) };
+}
 function Row({ children }) { return <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>{children}</div>; }
 function SectionLabel({ children }) { return <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.6, textTransform: "uppercase", color: P.accentDeep, margin: "14px 0 8px" }}>{children}</div>; }
 function QA({ q, a }) {
@@ -558,7 +956,7 @@ function QA({ q, a }) {
   );
 }
 function Spinner() { return <span style={{ width: 13, height: 13, border: `2px solid rgba(109,78,201,0.25)`, borderTopColor: P.accent, borderRadius: "50%", display: "inline-block", animation: "spin 0.7s linear infinite" }}><style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style></span>; }
-
+ 
 function renderResumeInner(r) {
   const e2 = (s = "") => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const url = (u) => (u.startsWith("http") ? u : "https://" + u);
@@ -576,3 +974,16 @@ function renderResumeInner(r) {
     : (r.certifications ? `<div>${e2(r.certifications)}</div>` : "");
   return `<div style="text-align:center;margin-bottom:8px"><div style="font-size:20px;font-weight:800">${e2(r.name)}</div>${r.title ? `<div style="font-size:13px">${e2(r.title)}</div>` : ""}<div style="font-size:11px;color:#333;margin-top:3px">${contactParts.join(" &bull; ")}</div></div>${sec("Summary", r.summary ? `<div>${e2(r.summary)}</div>` : "")}${sec("Skills", r.skills ? `<div>${e2(r.skills)}</div>` : "")}${sec("Experience", exp)}${sec("Projects", proj)}${sec("Education", edu)}${sec("Certifications", certs)}`;
 }
+ 
+
+
+
+
+
+
+
+
+
+
+
+
