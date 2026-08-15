@@ -1,13 +1,13 @@
 import React, { useState, useRef, useEffect } from "react";
  
 // ─── Persistence (localStorage) ─────────────────────────────────────────────
-const LS_KEY = "resumeTailor.apiKey";
+const LS_KEY = "resumeTailor.apiKey"; // legacy/opt-in persistent key
 const LS_PROFILE = "resumeTailor.myProfile";     // legacy single profile (migrated)
 const LS_PROFILES = "resumeTailor.profiles";     // { id: {name,...profile fields, _label} }
 const LS_ACTIVE = "resumeTailor.activeProfile";  // id of the currently selected profile
 const LS_HISTORY = "resumeTailor.history";
 const loadLS = (k, fb) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : fb; } catch { return fb; } };
-const saveLS = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+const saveLS = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch { return false; } };
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
  
 const DEFAULT_PROFILE = {
@@ -36,16 +36,24 @@ function esc(s = "") {
     .replace(/\{/g, "\\{").replace(/\}/g, "\\}")
     .replace(/~/g, "\\textasciitilde{}").replace(/\^/g, "\\textasciicircum{}");
 }
-const urlize = (u = "") => (u.startsWith("http") ? u : "https://" + u);
+export function safeWebUrl(value = "") {
+  const raw = String(value).trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.href : "";
+  } catch { return ""; }
+}
+const urlize = safeWebUrl;
  
 function buildLatex(r) {
   const contactBits = [
     r.email && `\\href{mailto:${esc(r.email)}}{${esc(r.email)}}`,
     r.phone && esc(r.phone),
     r.location && esc(r.location),
-    r.linkedin && `\\href{${esc(urlize(r.linkedin))}}{LinkedIn}`,
-    r.github && `\\href{${esc(urlize(r.github))}}{GitHub}`,
-    r.website && `\\href{${esc(urlize(r.website))}}{Website}`,
+    safeWebUrl(r.linkedin) && `\\href{${esc(safeWebUrl(r.linkedin))}}{LinkedIn}`,
+    safeWebUrl(r.github) && `\\href{${esc(safeWebUrl(r.github))}}{GitHub}`,
+    safeWebUrl(r.website) && `\\href{${esc(safeWebUrl(r.website))}}{Website}`,
   ].filter(Boolean);
   const bulletList = (items) => items && items.length
     ? `\\begin{itemize}[leftmargin=1.2em, itemsep=1pt, topsep=2pt, parsep=0pt]\n${items.map((b) => `  \\item ${esc(b)}`).join("\n")}\n\\end{itemize}` : "";
@@ -92,7 +100,7 @@ ${certBody ? `\\section{Certifications}\n${certBody}\n` : ""}
 }
  
 // ─── Gemini ──────────────────────────────────────────────────────────────────
-const GEMINI_MODEL = "gemini-3.6-flash";
+const GEMINI_MODEL = import.meta.env.VITE_GEMINI_MODEL || "gemini-3.5-flash";
 const geminiURL = () => `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 async function geminiCall(key, parts, generationConfig) {
   const body = { contents: [{ role: "user", parts }] };
@@ -121,7 +129,7 @@ async function geminiCall(key, parts, generationConfig) {
     if (!res.ok) {
       const t = await res.text();
       if (res.status === 400 && /API key not valid/i.test(t)) throw new Error("Invalid API key.");
-      if (res.status === 404) throw new Error("Model unavailable — Google may have retired it. Update GEMINI_MODEL.");
+      if (res.status === 404) throw new Error("Model unavailable — set VITE_GEMINI_MODEL to a model enabled for your API key.");
       // Transient — Google overloaded or rate-limiting. Back off and retry.
       if ((res.status === 503 || res.status === 429 || res.status === 500) && attempt < maxAttempts) {
         await new Promise((r) => setTimeout(r, 1200 * attempt)); // 1.2s, 2.4s, 3.6s
@@ -142,6 +150,25 @@ const stripJson = (t) => t.replace(/```json/gi, "").replace(/```/g, "").trim();
 function safeParse(t, ctx) {
   try { return JSON.parse(stripJson(t)); }
   catch { throw new Error(`${ctx}: the AI returned invalid JSON. Try again.`); }
+}
+const asString = (v) => typeof v === "string" ? v : "";
+const asStrings = (v) => Array.isArray(v) ? v.filter((x) => typeof x === "string").slice(0, 50) : [];
+const clampScore = (v) => Number.isFinite(Number(v)) ? Math.max(0, Math.min(100, Math.round(Number(v)))) : null;
+export function normalizeTailoredResult(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Resume tailoring: incomplete AI response. Try again.");
+  const rows = (key, mapper, max = 12) => Array.isArray(raw[key]) ? raw[key].slice(0, max).map(mapper) : [];
+  return {
+    ...raw,
+    summary: asString(raw.summary), skills: asString(raw.skills),
+    experienceStructured: rows("experienceStructured", (e = {}) => ({ role: asString(e.role), company: asString(e.company), location: asString(e.location), dates: asString(e.dates), bullets: asStrings(e.bullets).slice(0, 6) })),
+    projectsStructured: rows("projectsStructured", (p = {}) => ({ name: asString(p.name), tech: asString(p.tech), link: safeWebUrl(p.link), bullets: asStrings(p.bullets).slice(0, 5) })),
+    educationStructured: rows("educationStructured", (e = {}) => ({ degree: asString(e.degree), school: asString(e.school), location: asString(e.location), dates: asString(e.dates) })),
+    certificationsStructured: rows("certificationsStructured", (c = {}) => ({ name: asString(c.name), link: safeWebUrl(c.link) })),
+    keywordsMatched: asStrings(raw.keywordsMatched), keywordsMissing: asStrings(raw.keywordsMissing),
+    improvements: asStrings(raw.improvements), fabricationWarnings: asStrings(raw.fabricationWarnings),
+    matchScore: clampScore(raw.matchScore),
+    matchVerdict: ["strong", "moderate", "weak"].includes(raw.matchVerdict) ? raw.matchVerdict : "moderate",
+  };
 }
 // Minimal-thinking + JSON mode for cheap, fast, parseable extraction calls.
 const JSON_CFG = { responseMimeType: "application/json" };
@@ -224,6 +251,36 @@ TARGET JOB DESCRIPTION:
 ${jd}`;
   return safeParse(await geminiCall(key, [{ text: prompt }], JSON_CFG), "Resume tailoring");
 }
+async function auditTailoredResume(key, profile, resume) {
+  const prompt = `Act as a strict resume fact checker. Compare every claim in the GENERATED RESUME against the SOURCE PROFILE. A claim is supported only when the source explicitly states it or it is a faithful rephrasing. Flag invented skills, tools, employers, titles, dates, degrees, certifications, projects, responsibilities, and especially invented or inflated metrics. Also flag vague or awkward writing that should be reviewed. Do not reward keyword matching and do not assume facts.
+
+Return ONLY valid JSON:
+{"unsupportedClaims":["exact unsupported claim and why"],"qualityIssues":["specific writing or clarity issue"],"verdict":"pass or review"}
+
+SOURCE PROFILE:
+${JSON.stringify(profile, null, 2)}
+
+GENERATED RESUME:
+${JSON.stringify(resume, null, 2)}`;
+  const raw = safeParse(await geminiCall(key, [{ text: prompt }], JSON_CFG), "Quality review");
+  const unsupportedClaims = asStrings(raw?.unsupportedClaims).slice(0, 20);
+  const qualityIssues = asStrings(raw?.qualityIssues).slice(0, 20);
+  return { unsupportedClaims, qualityIssues, verdict: unsupportedClaims.length ? "review" : "pass" };
+}
+async function regenerateResumeSection(key, profile, jd, resume, section) {
+  const prompt = `Rewrite ONLY the requested resume section to improve clarity, impact, and relevance to the job. Use only facts explicitly supported by the source profile. Never invent skills, tools, metrics, dates, employers, or responsibilities. Return ONLY valid JSON with one property named "${section}" using the same shape as the current section.
+
+SOURCE PROFILE:
+${JSON.stringify(profile, null, 2)}
+
+JOB DESCRIPTION:
+${jd}
+
+CURRENT ${section.toUpperCase()}:
+${JSON.stringify(resume[section], null, 2)}`;
+  const raw = safeParse(await geminiCall(key, [{ text: prompt }], JSON_CFG), "Section rewrite");
+  return normalizeTailoredResult({ ...resume, [section]: raw?.[section] })[section];
+}
 async function classifyJD(key, text) {
   const prompt = `Decide whether the following text is a JOB DESCRIPTION / job posting (a specific role an employer is hiring for, with responsibilities, requirements, or qualifications).
  
@@ -303,12 +360,13 @@ function Field({ label, value, onChange, placeholder, area, rows = 3, half, type
  
 export default function App() {
   const [tab, setTab] = useState("profile");
-  const [apiKey, setApiKey] = useState(() => loadLS(LS_KEY, ""));
+  const [rememberKey, setRememberKey] = useState(() => Boolean(loadLS(LS_KEY, "")));
+  const [apiKey, setApiKey] = useState(() => loadLS(LS_KEY, "") || sessionStorage.getItem(LS_KEY) || "");
   const [showKey, setShowKey] = useState(false);
   const [profiles, setProfiles] = useState(() => loadProfiles());
   const [activeId, setActiveId] = useState(() => {
     const saved = loadLS(LS_ACTIVE, null);
-    const all = loadProfiles();
+    const all = profiles;
     return saved && all[saved] ? saved : Object.keys(all)[0];
   });
   const [mode, setMode] = useState("me"); // "me" | "other"
@@ -329,15 +387,21 @@ export default function App() {
   const [prepLoading, setPrepLoading] = useState(false);
   const [prepJd, setPrepJd] = useState("");
   const [pageOverflow, setPageOverflow] = useState(false);
+  const [editingResult, setEditingResult] = useState(false);
+  const [regeneratingSection, setRegeneratingSection] = useState("");
   const [bgId, setBgId] = useState(() => loadLS("resumeTailor.bg", "forest"));
   useEffect(() => saveLS("resumeTailor.bg", bgId), [bgId]);
   const bg = BACKGROUNDS.find((b) => b.id === bgId) || BACKGROUNDS[0];
   const cycleBg = () => { const i = BACKGROUNDS.findIndex((b) => b.id === bgId); setBgId(BACKGROUNDS[(i + 1) % BACKGROUNDS.length].id); };
   const jdFileRef = useRef();
   const resumeFileRef = useRef();
+  const backupFileRef = useRef();
   const previewRef = useRef();
  
-  useEffect(() => saveLS(LS_KEY, apiKey), [apiKey]);
+  useEffect(() => {
+    sessionStorage.setItem(LS_KEY, apiKey);
+    if (rememberKey) saveLS(LS_KEY, apiKey); else localStorage.removeItem(LS_KEY);
+  }, [apiKey, rememberKey]);
   useEffect(() => saveLS(LS_PROFILES, profiles), [profiles]);
   useEffect(() => saveLS(LS_ACTIVE, activeId), [activeId]);
   useEffect(() => saveLS(LS_HISTORY, history), [history]);
@@ -392,6 +456,7 @@ export default function App() {
  
   async function handleJDImage(e) {
     const files = Array.from(e.target.files || []); if (!files.length) return;
+    if (files.length > 6 || files.some((f) => f.size > 8 * 1024 * 1024)) { setStatus("Use at most 6 images, no larger than 8 MB each."); e.target.value = ""; return; }
     if (!hasKey) { setStatus("Add your free Gemini API key first."); return; }
     setJdImgName(files.length === 1 ? files[0].name : `${files.length} screenshots`);
     setStatus(files.length === 1 ? "Reading screenshot…" : `Reading & stitching ${files.length} screenshots…`);
@@ -408,6 +473,7 @@ export default function App() {
   }
   async function handleResumeUpload(e) {
     const file = e.target.files?.[0]; if (!file) return;
+    if (file.size > 10 * 1024 * 1024) { setStatus("Resume files must be 10 MB or smaller."); e.target.value = ""; return; }
     if (!hasKey) { setStatus("Add your Gemini API key first."); return; }
     // Protect a curated master profile from being silently wiped by an upload.
     if (mode === "me" && (activeProfile.experience?.trim() || activeProfile.skills?.trim())) {
@@ -455,12 +521,19 @@ export default function App() {
     } catch { /* if the check itself fails, don't block generation */ }
     setStatus("Tailoring the resume… (retries automatically if Gemini is busy)");
     try {
-      const tailored = await tailorResume(apiKey, profile, jd, customPrompt);
+      const tailored = normalizeTailoredResult(await tailorResume(apiKey, profile, jd, customPrompt));
+      setStatus("Fact-checking every generated claim…");
+      try {
+        tailored.qualityReview = await auditTailoredResume(apiKey, profile, tailored);
+        tailored.fabricationWarnings = [...new Set([...(tailored.fabricationWarnings || []), ...tailored.qualityReview.unsupportedClaims])];
+      } catch (auditError) {
+        tailored.qualityReview = { verdict: "unavailable", unsupportedClaims: [], qualityIssues: [], error: auditError.message };
+      }
       const merged = { name: profile.name, title: profile.title, email: profile.email, phone: profile.phone, location: profile.location, linkedin: profile.linkedin, github: profile.github, website: profile.website, ...tailored };
       merged.keywordCoverage = computeKeywordCoverage(merged, jd); // real, reproducible
       const t = buildLatex(merged);
       setResult(merged); setTex(t); setTab("result"); setStatus("Done — review, then download.");
-      setHistory((h) => [{ id: uid(), label: jobLabel || deriveLabel(jd), person: mode === "me" ? (activeProfile._label || "Me") : (profile.name || "Someone else"), date: new Date().toISOString(), jd, result: merged, tex: t }, ...h].slice(0, 50));
+      setHistory((h) => [{ id: uid(), label: jobLabel || deriveLabel(jd), person: mode === "me" ? (activeProfile._label || "Me") : (profile.name || "Someone else"), date: new Date().toISOString(), jd, result: merged, tex: t }, ...h].slice(0, 20));
     } catch (err) { setStatus("Generation failed: " + err.message); }
     finally { setLoading(false); }
   }
@@ -482,6 +555,37 @@ export default function App() {
   }
   function openHistory(e) { setResult(e.result); setTex(e.tex); setJd(e.jd); setCoverLetter(""); setTab("result"); setStatus(`Loaded: ${e.label}`); }
   function deleteHistory(id) { setHistory((h) => h.filter((e) => e.id !== id)); }
+  function updateGenerated(next) { setResult(next); setTex(buildLatex(next)); }
+  async function regenerateSection(section) {
+    if (!result || !hasKey) { setStatus("Add your Gemini key before rewriting a section."); return; }
+    setRegeneratingSection(section); setStatus(`Improving ${section.replace("Structured", "")}…`);
+    try {
+      const value = await regenerateResumeSection(apiKey, profile, jd, result, section);
+      updateGenerated({ ...result, [section]: value });
+      setStatus("Section improved. Review the changes before downloading.");
+    } catch (err) { setStatus("Section rewrite failed: " + err.message); }
+    finally { setRegeneratingSection(""); }
+  }
+  function exportBackup() {
+    const payload = { version: 1, exportedAt: new Date().toISOString(), profiles, activeId, history, background: bgId };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob); const a = document.createElement("a");
+    a.href = url; a.download = `resume-tailor-backup-${new Date().toISOString().slice(0, 10)}.json`; a.click(); URL.revokeObjectURL(url);
+  }
+  async function importBackup(e) {
+    const file = e.target.files?.[0]; if (!file) return;
+    try {
+      if (file.size > 5 * 1024 * 1024) throw new Error("Backup must be 5 MB or smaller.");
+      const data = JSON.parse(await file.text());
+      if (data?.version !== 1 || !data.profiles || typeof data.profiles !== "object") throw new Error("This is not a valid Resume Tailor backup.");
+      const ids = Object.keys(data.profiles); if (!ids.length) throw new Error("The backup has no profiles.");
+      setProfiles(data.profiles); setActiveId(ids.includes(data.activeId) ? data.activeId : ids[0]);
+      setHistory(Array.isArray(data.history) ? data.history.slice(0, 20) : []);
+      if (BACKGROUNDS.some((b) => b.id === data.background)) setBgId(data.background);
+      setStatus("Backup restored successfully.");
+    } catch (err) { setStatus("Could not restore backup: " + err.message); }
+    finally { e.target.value = ""; }
+  }
   function downloadTex() {
     const blob = new Blob([tex], { type: "text/plain" }); const url = URL.createObjectURL(blob);
     const a = document.createElement("a"); a.href = url; a.download = `${(result?.name || "resume").replace(/\s+/g, "_")}.tex`; a.click(); URL.revokeObjectURL(url);
@@ -540,21 +644,25 @@ export default function App() {
         <div style={{ ...glassCard, padding: "12px 16px", margin: "18px 0" }}>
           <div style={{ fontSize: 11.5, fontWeight: 700, color: P.accentDeep, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 7 }}>Gemini API key {hasKey ? "✓ saved" : "— required"}</div>
           <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-            <input type={showKey ? "text" : "password"} value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="Paste your free Gemini API key…" style={{ flex: "1 1 260px", padding: "9px 11px", fontSize: 13, fontFamily: font, border: `1px solid ${P.fieldBorder}`, borderRadius: 11, background: P.field, color: P.ink, outline: "none" }} />
+            <input aria-label="Gemini API key" type={showKey ? "text" : "password"} value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="Paste your free Gemini API key…" style={{ flex: "1 1 260px", padding: "9px 11px", fontSize: 13, fontFamily: font, border: `1px solid ${P.fieldBorder}`, borderRadius: 11, background: P.field, color: P.ink, outline: "none" }} />
             <button style={tabBtn(false)} onClick={() => setShowKey((s) => !s)}>{showKey ? "Hide" : "Show"}</button>
             <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" style={{ ...tabBtn(false), textDecoration: "none" }}>Get a free key ↗</a>
           </div>
+          <label style={{ display: "inline-flex", gap: 7, alignItems: "center", marginTop: 9, color: P.muted, fontSize: 11.5 }}>
+            <input type="checkbox" checked={rememberKey} onChange={(e) => setRememberKey(e.target.checked)} /> Remember key after I close this tab
+          </label>
+          <div style={{ color: P.faint, fontSize: 11, marginTop: 5 }}>Your resume, job description, and key are sent directly to Google Gemini when you generate. No paid server is used.</div>
         </div>
  
-        <div style={{ display: "flex", gap: 8, margin: "16px 0", flexWrap: "wrap" }}>
-          <button style={tabBtn(tab === "profile")} onClick={() => setTab("profile")}>1 · Profile</button>
-          <button style={tabBtn(tab === "job")} onClick={() => setTab("job")}>2 · Job</button>
-          <button style={tabBtn(tab === "result")} onClick={() => setTab("result")} disabled={!result}>3 · Result</button>
-          <button style={tabBtn(tab === "prep")} onClick={() => setTab("prep")}>🎤 Interview prep</button>
-          <button style={tabBtn(tab === "history")} onClick={() => setTab("history")}>History ({history.length})</button>
+        <div role="tablist" aria-label="Resume workflow" style={{ display: "flex", gap: 8, margin: "16px 0", flexWrap: "wrap" }}>
+          <button role="tab" aria-selected={tab === "profile"} style={tabBtn(tab === "profile")} onClick={() => setTab("profile")}>1 · Profile</button>
+          <button role="tab" aria-selected={tab === "job"} style={tabBtn(tab === "job")} onClick={() => setTab("job")}>2 · Job</button>
+          <button role="tab" aria-selected={tab === "result"} style={tabBtn(tab === "result")} onClick={() => setTab("result")} disabled={!result}>3 · Result</button>
+          <button role="tab" aria-selected={tab === "prep"} style={tabBtn(tab === "prep")} onClick={() => setTab("prep")}>🎤 Interview prep</button>
+          <button role="tab" aria-selected={tab === "history"} style={tabBtn(tab === "history")} onClick={() => setTab("history")}>History ({history.length})</button>
         </div>
  
-        {status && <div style={{ ...glassCard, padding: "9px 14px", fontSize: 13, marginBottom: 16, display: "flex", alignItems: "center", gap: 8 }}>{loading && <Spinner />}{status}</div>}
+        {status && <div role="status" aria-live="polite" style={{ ...glassCard, padding: "9px 14px", fontSize: 13, marginBottom: 16, display: "flex", alignItems: "center", gap: 8 }}>{loading && <Spinner />}{status}</div>}
  
         {tab === "profile" && (
           <div style={glassCard}>
@@ -766,11 +874,20 @@ export default function App() {
               <button style={{ ...tabBtn(false), padding: "10px 18px" }} onClick={downloadTex}>⬇ .tex</button>
               <button style={{ ...tabBtn(false), padding: "10px 18px", opacity: clLoading ? 0.6 : 1 }} onClick={genCoverLetter} disabled={clLoading}>{clLoading ? "Writing…" : "✦ Cover letter"}</button>
               <a href="https://www.overleaf.com" target="_blank" rel="noreferrer" style={{ ...tabBtn(false), padding: "10px 18px", textDecoration: "none", display: "inline-block" }}>Overleaf ↗</a>
+              <button style={{ ...tabBtn(false), padding: "10px 18px" }} onClick={() => setEditingResult((v) => !v)}>{editingResult ? "Done editing" : "✎ Edit resume"}</button>
             </div>
+            {editingResult && <ResultEditor result={result} onChange={updateGenerated} onRegenerate={regenerateSection} regenerating={regeneratingSection} />}
             {result.fabricationWarnings?.length > 0 && (
               <div style={{ background: P.warnSoft, border: `1px solid #f0d5a0`, borderRadius: 12, padding: "10px 12px", fontSize: 13, marginBottom: 14, color: P.warn }}>
                 <strong>⚠ Verify before sending:</strong>
                 <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>{result.fabricationWarnings.map((w, i) => <li key={i}>{w}</li>)}</ul>
+              </div>
+            )}
+            {result.qualityReview && (
+              <div style={{ background: result.qualityReview.verdict === "pass" ? "rgba(47,125,87,0.15)" : P.warnSoft, border: `1px solid ${result.qualityReview.verdict === "pass" ? "rgba(127,224,173,0.4)" : "#f0d5a0"}`, borderRadius: 12, padding: "10px 12px", fontSize: 13, marginBottom: 14 }}>
+                <strong>{result.qualityReview.verdict === "pass" ? "✓ Independent fact-check passed" : result.qualityReview.verdict === "review" ? "⚠ Independent fact-check needs your review" : "Quality check unavailable"}</strong>
+                {result.qualityReview.qualityIssues?.length > 0 && <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>{result.qualityReview.qualityIssues.map((issue, i) => <li key={i}>{issue}</li>)}</ul>}
+                {result.qualityReview.error && <div style={{ marginTop: 5, color: P.muted }}>{result.qualityReview.error} Review the resume manually before applying.</div>}
               </div>
             )}
             {result.notes && <div style={{ background: P.accentSoft, borderRadius: 12, padding: "10px 12px", fontSize: 13, marginBottom: 14 }}><strong>What the AI emphasized:</strong> {result.notes}</div>}
@@ -844,6 +961,11 @@ export default function App() {
         {tab === "history" && (
           <div style={glassCard}>
             <SectionLabel>Your generated resumes</SectionLabel>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 14 }}>
+              <button style={tabBtn(false)} onClick={exportBackup}>⬇ Export backup</button>
+              <button style={tabBtn(false)} onClick={() => backupFileRef.current?.click()}>⬆ Restore backup</button>
+              <input ref={backupFileRef} type="file" accept="application/json,.json" hidden onChange={importBackup} />
+            </div>
             {history.length === 0 ? <p style={{ fontSize: 13, color: P.muted }}>No resumes yet.</p> :
               history.map((e) => (
                 <div key={e.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "11px 13px", border: `1px solid rgba(109,78,201,0.15)`, borderRadius: 12, marginBottom: 8, background: "rgba(255,255,255,0.5)" }}>
@@ -928,7 +1050,7 @@ function extractJdKeywords(jd) {
   }
   return [...found];
 }
-function computeKeywordCoverage(resume, jd) {
+export function computeKeywordCoverage(resume, jd) {
   const { norm, despaced } = resumeToPlainText(resume);
   const kws = extractJdKeywords(jd);
   if (kws.length < 3) return null; // too few real skills detected to be meaningful
@@ -956,13 +1078,38 @@ function QA({ q, a }) {
   );
 }
 function Spinner() { return <span style={{ width: 13, height: 13, border: `2px solid rgba(109,78,201,0.25)`, borderTopColor: P.accent, borderRadius: "50%", display: "inline-block", animation: "spin 0.7s linear infinite" }}><style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style></span>; }
- 
+
+function ResultEditor({ result, onChange, onRegenerate, regenerating }) {
+  const editBullet = (section, row, bullet, value) => {
+    const next = { ...result, [section]: result[section].map((item, i) => i === row ? { ...item, bullets: item.bullets.map((b, j) => j === bullet ? value : b) } : item) };
+    onChange(next);
+  };
+  const inputStyle = { width: "100%", boxSizing: "border-box", padding: "8px 10px", marginBottom: 8, borderRadius: 9, border: `1px solid ${P.fieldBorder}`, background: P.field, color: P.ink, font: `13px ${font}` };
+  return <div style={{ ...glassCard, padding: 15, marginBottom: 16 }}>
+    <SectionLabel>Edit generated resume</SectionLabel>
+    <textarea aria-label="Resume summary" rows={3} style={inputStyle} value={result.summary || ""} onChange={(e) => onChange({ ...result, summary: e.target.value })} />
+    <textarea aria-label="Resume skills" rows={2} style={inputStyle} value={result.skills || ""} onChange={(e) => onChange({ ...result, skills: e.target.value })} />
+    {["experienceStructured", "projectsStructured"].map((section) => <div key={section} style={{ marginTop: 12 }}>
+      <button disabled={Boolean(regenerating)} onClick={() => onRegenerate(section)} style={{ ...tabBtn(false), padding: "5px 10px", fontSize: 11.5, marginBottom: 5 }}>
+        {regenerating === section ? "Improving…" : `✦ Improve ${section === "experienceStructured" ? "experience" : "projects"}`}
+      </button>
+      {(result[section] || []).map((item, row) => <div key={`${section}-${row}`} style={{ marginTop: 10 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 5 }}>{item.role || item.name || `Item ${row + 1}`}</div>
+        {(item.bullets || []).map((bullet, i) => <textarea key={i} aria-label={`Bullet ${i + 1}`} rows={2} style={inputStyle} value={bullet} onChange={(e) => editBullet(section, row, i, e.target.value)} />)}
+      </div>)}
+    </div>)}
+    <div style={{ fontSize: 11.5, color: P.faint }}>Edits immediately update both PDF and LaTeX exports.</div>
+  </div>;
+}
+
 function renderResumeInner(r) {
-  const e2 = (s = "") => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const url = (u) => (u.startsWith("http") ? u : "https://" + u);
-  const link = (href, label) => `<a href="${e2(url(href))}" style="color:#4a2f9e;text-decoration:none">${e2(label)}</a>`;
+  const e2 = (s = "") => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  const link = (href, label, mail = false) => {
+    const safe = mail ? `mailto:${String(href).replace(/[\r\n"'<>]/g, "")}` : safeWebUrl(href);
+    return safe ? `<a href="${e2(safe)}" style="color:#4a2f9e;text-decoration:none">${e2(label)}</a>` : e2(label);
+  };
   const contactParts = [
-    r.email && link("mailto:" + r.email, r.email), r.phone && e2(r.phone), r.location && e2(r.location),
+    r.email && link(r.email, r.email, true), r.phone && e2(r.phone), r.location && e2(r.location),
     r.linkedin && link(r.linkedin, "LinkedIn"), r.github && link(r.github, "GitHub"), r.website && link(r.website, "Website"),
   ].filter(Boolean);
   const sec = (t, body) => body ? `<h2 style="font-size:13px;border-bottom:1px solid #333;margin:12px 0 6px;padding-bottom:2px;text-transform:uppercase;letter-spacing:1px">${t}</h2>${body}` : "";

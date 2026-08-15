@@ -2,7 +2,7 @@
 
 An AI-powered web app that turns any job description into a tailored, ATS-friendly resume — with a match score, a cover letter, clickable links, and both PDF and LaTeX export. Runs entirely in the browser, free, using your own Google Gemini API key.
 
-![Tech](https://img.shields.io/badge/React-18-61dafb) ![Build](https://img.shields.io/badge/Vite-5-646cff) ![AI](https://img.shields.io/badge/Gemini-3.5--flash-8b6bff)
+![Tech](https://img.shields.io/badge/React-18-61dafb) ![Build](https://img.shields.io/badge/Vite-5-646cff) ![AI](https://img.shields.io/badge/Gemini-configurable-8b6bff)
 
 ---
 
@@ -19,18 +19,21 @@ Paste a job description (or upload a screenshot of one) and the app uses AI to r
 - **Saved profile** — fill your details once (or auto-fill from an existing resume) and they load automatically every visit.
 - **"Me" vs "Someone else" mode** — keep your own master profile, or make a resume for someone else without touching yours.
 - **History** — every generated resume is saved per job, reopenable anytime.
+- **Independent fact-check** — a second AI pass checks generated claims against the source profile before export.
+- **Editable results** — revise summaries, skills, and bullets or improve one section without regenerating everything.
+- **Backup & restore** — export profiles and history to a local JSON file and restore them later.
 - **Liquid-glass UI** — frosted panels over switchable nature-photo backgrounds, with an SVG displacement refraction effect.
 
 ## Privacy
 
-There is no backend and no database. Your profile, API key, and history are stored only in your browser's `localStorage`. The only network requests are directly from your browser to Google's Gemini API. Nothing is tracked or collected.
+There is no backend and no database. Your profile and history are stored only in your browser. The API key is session-only by default; you can explicitly choose to remember it. Resume and job content is sent directly to Google's Gemini API when you generate. Nothing is tracked by this app.
 
 ---
 
 ## Tech stack
 
 - **React 18** + **Vite 5** — static single-page app, no server
-- **Google Gemini** (`gemini-3.5-flash`) — vision + text, called directly from the browser
+- **Google Gemini** (configurable; defaults to `gemini-3.5-flash`) — vision + text, called directly from the browser
 - **html2pdf.js** — client-side PDF generation with clickable links
 - Pure inline styles + an SVG `feDisplacementMap` filter for the glass effect
 
@@ -68,11 +71,13 @@ The Gemini free tier is generous enough for regular personal use.
 
 The app is a static build and deploys free anywhere. On **Vercel**: connect this repo, framework preset **Vite**, build command `npm run build`, output directory `dist`. Every push auto-redeploys.
 
+To use another available Gemini model, copy `.env.example` to `.env.local` and change `VITE_GEMINI_MODEL`.
+
 ---
 
 ## Notes
 
-- Model names change over time. If generation ever fails with a 404, update the `GEMINI_MODEL` constant in `src/App.jsx` to the current model.
+- Model names change over time. If generation ever fails with a 404, set `VITE_GEMINI_MODEL` in `.env.local` to a model enabled for your key.
 - The AI flags any content it isn't sure is grounded in your profile — always review before sending.
 
 ## License
