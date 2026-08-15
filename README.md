@@ -23,6 +23,11 @@ Paste a job description (or upload a screenshot of one) and the app uses AI to r
 - **Editable results** — revise summaries, skills, and bullets or improve one section without regenerating everything.
 - **Backup & restore** — export profiles and history to a local JSON file and restore them later.
 - **Fast perceived results** — structured text resumes parse locally, and the tailored resume appears before the independent fact-check finishes.
+- **Evidence-backed corrections** — unsupported text is corrected automatically when an exact grounded replacement is available, with source evidence shown for review.
+- **Word export** — downloads a single-column `.docx` with real Word bullets and hyperlinks for ATS and recruiter workflows.
+- **Application tracker** — tracks company, role, status, date, and notes locally in the browser.
+- **Quality checks** — flags weak openings, long or repetitive bullets, sparse metrics, long summaries, and keyword-stuffed skills.
+- **Model fallback** — automatically retries an alternate Gemini model if the primary model is unavailable.
 - **Liquid-glass UI** — frosted panels over switchable nature-photo backgrounds, with an SVG displacement refraction effect.
 
 ## Privacy

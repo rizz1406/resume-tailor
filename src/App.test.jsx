@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { computeKeywordCoverage, normalizeProfile, normalizeSkills, normalizeTailoredResult, parseResumeTextLocally, rankProjectsByRelevance, safeWebUrl } from "./App.jsx";
+import { applyEvidenceCorrections, computeKeywordCoverage, normalizeProfile, normalizeSkills, normalizeTailoredResult, parseResumeTextLocally, rankProjectsByRelevance, runResumeQualityChecks, safeWebUrl } from "./App.jsx";
+import { buildResumeDocxBlob } from "./docxExport.js";
 
 describe("safeWebUrl", () => {
   it("normalizes normal web links", () => expect(safeWebUrl("github.com/example")).toBe("https://github.com/example"));
@@ -46,6 +47,31 @@ describe("project relevance", () => {
   it("puts the job-relevant project first without changing project content", () => {
     const projects = [{ name: "Churn", tech: "Python" }, { name: "BI Dashboard", tech: "Power BI, SQL" }];
     expect(rankProjectsByRelevance(projects, "Build Power BI dashboards with SQL")[0].name).toBe("BI Dashboard");
+  });
+});
+
+describe("evidence-backed correction", () => {
+  it("replaces only exact unsupported text and preserves the rest", () => {
+    const input = { summary: "Analyst writing advanced SQL", skills: "SQL", experienceStructured: [], projectsStructured: [] };
+    const result = applyEvidenceCorrections(input, [{ original: "advanced SQL", replacement: "SQL" }]);
+    expect(result.applied).toBe(1);
+    expect(result.resume.summary).toBe("Analyst writing SQL");
+  });
+});
+
+describe("resume quality checks", () => {
+  it("flags weak and overly long bullets", () => {
+    const issues = runResumeQualityChecks({ summary: "Short", skills: "SQL", experienceStructured: [{ bullets: ["Responsible for " + "very ".repeat(35) + "long reporting work"] }], projectsStructured: [] });
+    expect(issues.join(" ")).toMatch(/weak phrasing|longer than 32 words/);
+  });
+});
+
+describe("DOCX export", () => {
+  it("creates a non-empty OOXML zip", async () => {
+    const blob = await buildResumeDocxBlob({ name: "Jordan Lee", title: "Data Analyst", email: "jordan@example.com", summary: "Analyst", skills: "SQL, Python", experienceStructured: [{ role: "Analyst", company: "Acme", dates: "2022–Present", bullets: ["Built reports."] }] });
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    expect(String.fromCharCode(bytes[0], bytes[1])).toBe("PK");
+    expect(bytes.length).toBeGreaterThan(1000);
   });
 });
 

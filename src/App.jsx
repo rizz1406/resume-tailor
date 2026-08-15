@@ -6,6 +6,7 @@ const LS_PROFILE = "resumeTailor.myProfile";     // legacy single profile (migra
 const LS_PROFILES = "resumeTailor.profiles";     // { id: {name,...profile fields, _label} }
 const LS_ACTIVE = "resumeTailor.activeProfile";  // id of the currently selected profile
 const LS_HISTORY = "resumeTailor.history";
+const LS_APPLICATIONS = "resumeTailor.applications";
 const loadLS = (k, fb) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : fb; } catch { return fb; } };
 const saveLS = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch { return false; } };
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
@@ -138,6 +139,7 @@ ${certBody ? `\\section{Certifications}\n${certBody}\n` : ""}
 // ─── Gemini ──────────────────────────────────────────────────────────────────
 const GEMINI_MODEL = import.meta.env.VITE_GEMINI_MODEL || "gemini-3.5-flash";
 const GEMINI_FAST_MODEL = import.meta.env.VITE_GEMINI_FAST_MODEL || "gemini-3.5-flash-lite";
+const GEMINI_FALLBACK_MODEL = import.meta.env.VITE_GEMINI_FALLBACK_MODEL || "gemini-3.1-flash-lite";
 const geminiURL = (model) => `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 async function geminiCall(key, parts, generationConfig, model = GEMINI_MODEL) {
   const body = { contents: [{ role: "user", parts }] };
@@ -170,7 +172,8 @@ async function geminiCall(key, parts, generationConfig, model = GEMINI_MODEL) {
     if (!res.ok) {
       const t = await res.text();
       if (res.status === 400 && /API key not valid/i.test(t)) throw new Error("Invalid API key.");
-      if (res.status === 404) throw new Error("Model unavailable — set VITE_GEMINI_MODEL to a model enabled for your API key.");
+      if (res.status === 404 && model !== GEMINI_FALLBACK_MODEL) return geminiCall(key, parts, generationConfig, GEMINI_FALLBACK_MODEL);
+      if (res.status === 404) throw new Error("Gemini models are temporarily unavailable for this API key.");
       // Transient — Google overloaded or rate-limiting. Back off and retry.
       if ((res.status === 503 || res.status === 429 || res.status === 500) && attempt < maxAttempts) {
         await new Promise((r) => setTimeout(r, 1200 * attempt)); // 1.2s, 2.4s, 3.6s
@@ -223,11 +226,11 @@ const AUDIT_CFG = {
   responseSchema: {
     type: "OBJECT",
     properties: {
-      unsupportedClaims: { type: "ARRAY", items: { type: "STRING" } },
+      corrections: { type: "ARRAY", items: { type: "OBJECT", properties: { original: { type: "STRING" }, replacement: { type: "STRING" }, reason: { type: "STRING" }, sourceEvidence: { type: "STRING" } }, required: ["original", "replacement", "reason", "sourceEvidence"] } },
       qualityIssues: { type: "ARRAY", items: { type: "STRING" } },
       verdict: { type: "STRING", enum: ["pass", "review"] },
     },
-    required: ["unsupportedClaims", "qualityIssues", "verdict"],
+    required: ["corrections", "qualityIssues", "verdict"],
   },
 };
  
@@ -315,8 +318,10 @@ ${jd}`;
 async function auditTailoredResume(key, profile, resume) {
   const prompt = `Act as a strict resume fact checker. Compare every claim in the GENERATED RESUME against the SOURCE PROFILE. A claim is supported only when the source explicitly states it or it is a faithful rephrasing. Flag invented skills, tools, employers, titles, dates, degrees, certifications, projects, responsibilities, and especially invented or inflated metrics. Also flag vague or awkward writing that should be reviewed. Do not reward keyword matching and do not assume facts.
 
+For every unsupported claim, provide the exact substring from the generated resume, a truthful replacement grounded only in the source, a concise reason, and the exact source evidence. Keep replacements concise and grammatically compatible with the original location.
+
 Return ONLY valid JSON:
-{"unsupportedClaims":["exact unsupported claim and why"],"qualityIssues":["specific writing or clarity issue"],"verdict":"pass or review"}
+{"corrections":[{"original":"exact generated substring","replacement":"truthful replacement","reason":"why correction is required","sourceEvidence":"exact supporting source text"}],"qualityIssues":["specific writing or clarity issue"],"verdict":"pass or review"}
 
 SOURCE PROFILE:
 ${JSON.stringify(profile, null, 2)}
@@ -324,9 +329,9 @@ ${JSON.stringify(profile, null, 2)}
 GENERATED RESUME:
 ${JSON.stringify(resume, null, 2)}`;
   const raw = safeParse(await geminiCall(key, [{ text: prompt }], AUDIT_CFG, GEMINI_FAST_MODEL), "Quality review");
-  const unsupportedClaims = asStrings(raw?.unsupportedClaims).slice(0, 20);
+  const corrections = Array.isArray(raw?.corrections) ? raw.corrections.slice(0, 20).map((item = {}) => ({ original: asString(item.original), replacement: asString(item.replacement), reason: asString(item.reason), sourceEvidence: asString(item.sourceEvidence) })).filter((item) => item.original && item.reason) : [];
   const qualityIssues = asStrings(raw?.qualityIssues).slice(0, 20);
-  return { unsupportedClaims, qualityIssues, verdict: unsupportedClaims.length ? "review" : "pass" };
+  return { corrections, unsupportedClaims: corrections.map((item) => `${item.original}: ${item.reason}`), qualityIssues, verdict: corrections.length ? "review" : "pass" };
 }
 async function regenerateResumeSection(key, profile, jd, resume, section) {
   const prompt = `Rewrite ONLY the requested resume section to improve clarity, impact, and relevance to the job. Use only facts explicitly supported by the source profile. Never invent skills, tools, metrics, dates, employers, or responsibilities. Return ONLY valid JSON with one property named "${section}" using the same shape as the current section.
@@ -443,11 +448,13 @@ export default function App() {
   const [coverLetter, setCoverLetter] = useState("");
   const [clLoading, setClLoading] = useState(false);
   const [history, setHistory] = useState(() => loadLS(LS_HISTORY, []));
+  const [applications, setApplications] = useState(() => loadLS(LS_APPLICATIONS, []));
   const [profileSaved, setProfileSaved] = useState(false);
   const [prep, setPrep] = useState(null);
   const [prepLoading, setPrepLoading] = useState(false);
   const [prepJd, setPrepJd] = useState("");
   const [pageOverflow, setPageOverflow] = useState(false);
+  const [printPages, setPrintPages] = useState(1);
   const [editingResult, setEditingResult] = useState(false);
   const [regeneratingSection, setRegeneratingSection] = useState("");
   const [bgId, setBgId] = useState(() => loadLS("resumeTailor.bg", "forest"));
@@ -466,14 +473,16 @@ export default function App() {
   useEffect(() => { saveLS(LS_PROFILES, profiles); }, [profiles]);
   useEffect(() => { saveLS(LS_ACTIVE, activeId); }, [activeId]);
   useEffect(() => { saveLS(LS_HISTORY, history); }, [history]);
+  useEffect(() => { saveLS(LS_APPLICATIONS, applications); }, [applications]);
  
-  // One-page check: a US-letter page minus ~1in margins ≈ 9.5in of content.
-  // At 96dpi that's ~912px. The preview padding is 30px top+bottom (60px).
   useEffect(() => {
-    if (!result || !previewRef.current) { setPageOverflow(false); return; }
+    if (!result) { setPageOverflow(false); setPrintPages(1); return; }
     const id = setTimeout(() => {
-      const h = previewRef.current?.scrollHeight || 0;
-      setPageOverflow(h > 60 + 912); // content taller than one printable page
+      const probe = document.createElement("div");
+      Object.assign(probe.style, { position: "absolute", left: "-10000px", top: "0", width: "7.5in", fontFamily: "Arial, sans-serif", fontSize: "10pt", lineHeight: "1.35", visibility: "hidden" });
+      probe.innerHTML = renderResumeInner(result); document.body.appendChild(probe);
+      const pages = Math.max(1, Math.ceil(probe.scrollHeight / (10 * 96))); probe.remove();
+      setPrintPages(pages); setPageOverflow(pages > 1);
     }, 60);
     return () => clearTimeout(id);
   }, [result]);
@@ -535,7 +544,6 @@ export default function App() {
   async function handleResumeUpload(e) {
     const file = e.target.files?.[0]; if (!file) return;
     if (file.size > 10 * 1024 * 1024) { setStatus("Resume files must be 10 MB or smaller."); e.target.value = ""; return; }
-    if (!hasKey) { setStatus("Add your Gemini API key first."); return; }
     // Protect a curated master profile from being silently wiped by an upload.
     if (mode === "me" && (activeProfile.experience?.trim() || activeProfile.skills?.trim())) {
       if (!window.confirm("This will replace your saved profile with the parsed resume. Your current profile will be overwritten. Continue?")) {
@@ -546,17 +554,23 @@ export default function App() {
     try {
       let parsed;
       if (file.type.startsWith("image/")) {
+        if (!hasKey) throw new Error("Add your Gemini API key to read image resumes.");
         const base64 = await fileToBase64(file);
         const text = await extractJDFromImage(apiKey, base64, file.type);
         parsed = await parseResumeToProfile(apiKey, text);
       } else if (file.type === "application/pdf") {
+        if (!hasKey) throw new Error("Add your Gemini API key to read PDF resumes.");
         const base64 = await fileToBase64(file);
         const raw = await geminiCall(apiKey, [{ inline_data: { mime_type: "application/pdf", data: base64 } }, { text: "Extract all text from this resume PDF, raw text only." }], FAST_CFG, GEMINI_FAST_MODEL);
         parsed = await parseResumeToProfile(apiKey, raw);
       } else {
         const text = await file.text();
         const local = parseResumeTextLocally(text);
-        parsed = local.email && local.experience ? local : await parseResumeToProfile(apiKey, text);
+        if (local.email && local.experience) parsed = local;
+        else {
+          if (!hasKey) throw new Error("This text resume needs Gemini to understand its layout. Add your API key and retry.");
+          parsed = await parseResumeToProfile(apiKey, text);
+        }
       }
       const cleaned = normalizeProfile(parsed, mode === "me" ? activeProfile._label : "Someone else");
       if (mode === "me") setActiveProfileFull(cleaned); else setOtherProfile(cleaned);
@@ -579,6 +593,7 @@ export default function App() {
       tailored.projectsStructured = rankProjectsByRelevance(tailored.projectsStructured, jd);
       const merged = { name: profile.name, title: profile.title, email: profile.email, phone: profile.phone, location: profile.location, linkedin: profile.linkedin, github: profile.github, website: profile.website, ...tailored };
       merged.keywordCoverage = computeKeywordCoverage(merged, jd);
+      merged.qualityChecks = runResumeQualityChecks(merged);
       let t = buildLatex(merged);
       const entryId = uid();
       setResult(merged); setTex(t); setTab("result"); setLoading(false);
@@ -587,6 +602,14 @@ export default function App() {
       try {
         merged.qualityReview = await auditTailoredResume(apiKey, profile, merged);
         merged.fabricationWarnings = [...new Set([...(merged.fabricationWarnings || []), ...merged.qualityReview.unsupportedClaims])];
+        const corrected = applyEvidenceCorrections(merged, merged.qualityReview.corrections);
+        if (corrected.applied) {
+          Object.assign(merged, corrected.resume);
+          merged.qualityReview.autoCorrected = corrected.applied;
+          merged.fabricationWarnings = (merged.fabricationWarnings || []).filter((warning) => !corrected.appliedOriginals.some((original) => warning.startsWith(`${original}:`)));
+          merged.qualityChecks = runResumeQualityChecks(merged);
+          merged.keywordCoverage = computeKeywordCoverage(merged, jd);
+        }
       } catch (auditError) {
         merged.qualityReview = { verdict: "unavailable", unsupportedClaims: [], qualityIssues: [], error: auditError.message };
       }
@@ -612,8 +635,15 @@ export default function App() {
     catch (err) { setStatus("Prep failed: " + err.message); }
     finally { setPrepLoading(false); }
   }
-  function openHistory(e) { setResult(e.result); setTex(e.tex); setJd(e.jd); setCoverLetter(""); setTab("result"); setStatus(`Loaded: ${e.label}`); }
+  function openHistory(e) { setResult(e.result); setTex(e.tex); setJd(e.jd); setJobLabel(e.label || ""); setCoverLetter(""); setTab("result"); setStatus(`Loaded: ${e.label}`); }
   function deleteHistory(id) { setHistory((h) => h.filter((e) => e.id !== id)); }
+  function trackApplication() {
+    if (!result) return;
+    const label = jobLabel || deriveLabel(jd);
+    setApplications((items) => [{ id: uid(), company: label.includes("—") ? label.split("—")[0].trim() : "", role: label.includes("—") ? label.split("—").slice(1).join("—").trim() : label, status: "Preparing", date: new Date().toISOString().slice(0, 10), notes: "", matchScore: result.matchScore }, ...items]);
+    setStatus("Added to application tracker.");
+  }
+  const updateApplication = (id, field, value) => setApplications((items) => items.map((item) => item.id === id ? { ...item, [field]: value } : item));
   function updateGenerated(next) { setResult(next); setTex(buildLatex(next)); }
   async function regenerateSection(section) {
     if (!result || !hasKey) { setStatus("Add your Gemini key before rewriting a section."); return; }
@@ -626,7 +656,7 @@ export default function App() {
     finally { setRegeneratingSection(""); }
   }
   function exportBackup() {
-    const payload = { version: 1, exportedAt: new Date().toISOString(), profiles, activeId, history, background: bgId };
+    const payload = { version: 1, exportedAt: new Date().toISOString(), profiles, activeId, history, applications, background: bgId };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob); const a = document.createElement("a");
     a.href = url; a.download = `resume-tailor-backup-${new Date().toISOString().slice(0, 10)}.json`; a.click(); URL.revokeObjectURL(url);
@@ -640,6 +670,7 @@ export default function App() {
       const ids = Object.keys(data.profiles); if (!ids.length) throw new Error("The backup has no profiles.");
       setProfiles(data.profiles); setActiveId(ids.includes(data.activeId) ? data.activeId : ids[0]);
       setHistory(Array.isArray(data.history) ? data.history.slice(0, 20) : []);
+      setApplications(Array.isArray(data.applications) ? data.applications.slice(0, 200) : []);
       if (BACKGROUNDS.some((b) => b.id === data.background)) setBgId(data.background);
       setStatus("Backup restored successfully.");
     } catch (err) { setStatus("Could not restore backup: " + err.message); }
@@ -657,8 +688,18 @@ export default function App() {
       setStatus("PDF downloaded.");
     } catch (err) { setStatus("PDF failed: " + err.message); }
   }
+  async function downloadDocx() {
+    if (!result) return; setStatus("Building ATS Word document…");
+    try {
+      const { buildResumeDocxBlob } = await import("./docxExport.js");
+      const blob = await buildResumeDocxBlob(result); const url = URL.createObjectURL(blob);
+      const a = document.createElement("a"); a.href = url; a.download = `${(result.name || "resume").replace(/\s+/g, "_")}.docx`; a.click(); URL.revokeObjectURL(url);
+      setStatus("ATS Word document downloaded.");
+    } catch (err) { setStatus("Word export failed: " + err.message); }
+  }
   function printAtsPdf() {
     if (!result) return;
+    if (pageOverflow && !window.confirm(`This resume is estimated at ${printPages} pages. Continue to the print dialog anyway?`)) return;
     const popup = window.open("", "_blank");
     if (!popup) { setStatus("Allow pop-ups, then try ATS PDF again."); return; }
     popup.opener = null;
@@ -728,6 +769,7 @@ export default function App() {
           <button role="tab" aria-selected={tab === "result"} style={tabBtn(tab === "result")} onClick={() => setTab("result")} disabled={!result}>3 · Result</button>
           <button role="tab" aria-selected={tab === "prep"} style={tabBtn(tab === "prep")} onClick={() => setTab("prep")}>🎤 Interview prep</button>
           <button role="tab" aria-selected={tab === "history"} style={tabBtn(tab === "history")} onClick={() => setTab("history")}>History ({history.length})</button>
+          <button role="tab" aria-selected={tab === "applications"} style={tabBtn(tab === "applications")} onClick={() => setTab("applications")}>Applications ({applications.length})</button>
         </div>
  
         {status && <div role="status" aria-live="polite" style={{ ...glassCard, padding: "9px 14px", fontSize: 13, marginBottom: 16, display: "flex", alignItems: "center", gap: 8 }}>{loading && <Spinner />}{status}</div>}
@@ -935,16 +977,18 @@ export default function App() {
             )}
             {pageOverflow && (
               <div style={{ background: P.warnSoft, border: `1px solid #f0d5a0`, borderRadius: 12, padding: "10px 12px", fontSize: 13, marginBottom: 14, color: P.warn }}>
-                <strong>⚠ Slightly over one page.</strong> The content is a bit taller than a single letter page. Regenerate with a custom instruction like “cut to one page — drop the weakest bullet from each role,” or trim a project.
+                <strong>⚠ Estimated {printPages} print pages.</strong> Regenerate with a custom instruction like “cut to one page — drop the weakest bullet from each role,” or trim a project.
               </div>
             )}
             <div style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
               <button style={{ ...tabBtn(true), padding: "10px 18px" }} onClick={printAtsPdf}>⬇ ATS PDF</button>
+              <button style={{ ...tabBtn(false), padding: "10px 18px" }} onClick={downloadDocx}>⬇ Word (.docx)</button>
               <button title="Convenient visual export; ATS PDF is safer for applications" style={{ ...tabBtn(false), padding: "10px 18px" }} onClick={downloadPdf}>Visual PDF</button>
               <button style={{ ...tabBtn(false), padding: "10px 18px" }} onClick={downloadTex}>⬇ .tex</button>
               <button style={{ ...tabBtn(false), padding: "10px 18px", opacity: clLoading ? 0.6 : 1 }} onClick={genCoverLetter} disabled={clLoading}>{clLoading ? "Writing…" : "✦ Cover letter"}</button>
               <a href="https://www.overleaf.com" target="_blank" rel="noreferrer" style={{ ...tabBtn(false), padding: "10px 18px", textDecoration: "none", display: "inline-block" }}>Overleaf ↗</a>
               <button style={{ ...tabBtn(false), padding: "10px 18px" }} onClick={() => setEditingResult((v) => !v)}>{editingResult ? "Done editing" : "✎ Edit resume"}</button>
+              <button style={{ ...tabBtn(false), padding: "10px 18px" }} onClick={trackApplication}>＋ Track application</button>
             </div>
             {editingResult && <ResultEditor result={result} onChange={updateGenerated} onRegenerate={regenerateSection} regenerating={regeneratingSection} />}
             {result.fabricationWarnings?.length > 0 && (
@@ -953,13 +997,17 @@ export default function App() {
                 <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>{result.fabricationWarnings.map((w, i) => <li key={i}>{w}</li>)}</ul>
               </div>
             )}
+            {!pageOverflow && <div style={{ color: P.ok, fontSize: 12.5, marginBottom: 12 }}>✓ Print-layout check: estimated 1 page at US Letter with 0.5-inch margins.</div>}
             {result.qualityReview && (
               <div style={{ background: result.qualityReview.verdict === "pass" ? "rgba(47,125,87,0.15)" : P.warnSoft, border: `1px solid ${result.qualityReview.verdict === "pass" ? "rgba(127,224,173,0.4)" : "#f0d5a0"}`, borderRadius: 12, padding: "10px 12px", fontSize: 13, marginBottom: 14 }}>
                 <strong>{result.qualityReview.verdict === "pass" ? "✓ Independent fact-check passed" : result.qualityReview.verdict === "review" ? "⚠ Independent fact-check needs your review" : "Quality check unavailable"}</strong>
+                {result.qualityReview.autoCorrected > 0 && <div style={{ marginTop: 5 }}>Automatically corrected {result.qualityReview.autoCorrected} unsupported claim{result.qualityReview.autoCorrected > 1 ? "s" : ""} using source evidence.</div>}
+                {result.qualityReview.corrections?.map((item, i) => <details key={i} style={{ marginTop: 7 }}><summary style={{ cursor: "pointer" }}>{item.original}</summary><div style={{ margin: "5px 0 0 14px", color: P.muted }}><div><strong>Source:</strong> {item.sourceEvidence || "No supporting text found"}</div><div><strong>Correction:</strong> {item.replacement || "Removed"}</div><div><strong>Reason:</strong> {item.reason}</div></div></details>)}
                 {result.qualityReview.qualityIssues?.length > 0 && <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>{result.qualityReview.qualityIssues.map((issue, i) => <li key={i}>{issue}</li>)}</ul>}
                 {result.qualityReview.error && <div style={{ marginTop: 5, color: P.muted }}>{result.qualityReview.error} Review the resume manually before applying.</div>}
               </div>
             )}
+            {result.qualityChecks?.length > 0 && <div style={{ background: P.accentSoft, borderRadius: 12, padding: "10px 12px", fontSize: 13, marginBottom: 14 }}><strong>Resume quality checks</strong><ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>{result.qualityChecks.map((issue, i) => <li key={i}>{issue}</li>)}</ul></div>}
             {result.notes && <div style={{ background: P.accentSoft, borderRadius: 12, padding: "10px 12px", fontSize: 13, marginBottom: 14 }}><strong>What the AI emphasized:</strong> {result.notes}</div>}
             <Row>
               {result.keywordsMatched?.length > 0 && (
@@ -1047,6 +1095,24 @@ export default function App() {
                   </div>
                 </div>
               ))}
+          </div>
+        )}
+
+        {tab === "applications" && (
+          <div style={glassCard}>
+            <SectionLabel>Application tracker</SectionLabel>
+            {applications.length === 0 ? <p style={{ color: P.muted, fontSize: 13 }}>No applications tracked yet. Add one from a generated result.</p> : applications.map((item) => (
+              <div key={item.id} style={{ border: `1px solid ${P.glassBorder}`, background: P.field, borderRadius: 12, padding: 12, marginBottom: 9 }}>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                  <input aria-label="Company" value={item.company} placeholder="Company" onChange={(e) => updateApplication(item.id, "company", e.target.value)} style={{ flex: "1 1 140px", padding: 7, borderRadius: 8 }} />
+                  <input aria-label="Role" value={item.role} placeholder="Role" onChange={(e) => updateApplication(item.id, "role", e.target.value)} style={{ flex: "2 1 220px", padding: 7, borderRadius: 8 }} />
+                  <select aria-label="Application status" value={item.status} onChange={(e) => updateApplication(item.id, "status", e.target.value)} style={{ padding: 7, borderRadius: 8 }}>{["Preparing", "Applied", "Interview", "Offer", "Rejected", "Withdrawn"].map((status) => <option key={status}>{status}</option>)}</select>
+                  <input aria-label="Application date" type="date" value={item.date} onChange={(e) => updateApplication(item.id, "date", e.target.value)} style={{ padding: 7, borderRadius: 8 }} />
+                  <button style={{ ...tabBtn(false), color: P.danger, padding: "6px 10px" }} onClick={() => setApplications((items) => items.filter((app) => app.id !== item.id))}>Delete</button>
+                </div>
+                <textarea aria-label="Application notes" value={item.notes} onChange={(e) => updateApplication(item.id, "notes", e.target.value)} placeholder="Contact, next step, interview notes…" rows={2} style={{ width: "100%", marginTop: 8, padding: 8, borderRadius: 8, boxSizing: "border-box" }} />
+              </div>
+            ))}
           </div>
         )}
  
@@ -1138,6 +1204,33 @@ export function rankProjectsByRelevance(projects, jd) {
   const terms = new Set(normalizeText(jd).split(" ").filter((term) => term.length > 2 && !STOPWORDS.has(term)));
   const score = (project) => normalizeText([project.name, project.tech, ...(project.bullets || [])].join(" ")).split(" ").reduce((total, term) => total + (terms.has(term) ? 1 : 0), 0);
   return [...(projects || [])].map((project, index) => ({ project, index, score: score(project) })).sort((a, b) => b.score - a.score || a.index - b.index).map(({ project }) => project);
+}
+export function applyEvidenceCorrections(resume, corrections) {
+  let applied = 0; const appliedOriginals = new Set();
+  const fix = (value) => {
+    let text = asString(value);
+    for (const item of corrections || []) if (item.original && text.includes(item.original)) { text = text.replace(item.original, item.replacement || "").replace(/\s{2,}/g, " ").trim(); applied++; appliedOriginals.add(item.original); }
+    return text;
+  };
+  const next = { ...resume, summary: fix(resume.summary), skills: normalizeSkills(fix(resume.skills)) };
+  next.experienceStructured = (resume.experienceStructured || []).map((item) => ({ ...item, role: fix(item.role), company: fix(item.company), bullets: (item.bullets || []).map(fix).filter(Boolean) }));
+  next.projectsStructured = (resume.projectsStructured || []).map((item) => ({ ...item, name: fix(item.name), tech: fix(item.tech), bullets: (item.bullets || []).map(fix).filter(Boolean) }));
+  return { resume: next, applied, appliedOriginals: [...appliedOriginals] };
+}
+export function runResumeQualityChecks(resume) {
+  const issues = [];
+  const bullets = [...(resume.experienceStructured || []), ...(resume.projectsStructured || [])].flatMap((item) => item.bullets || []);
+  const weak = bullets.filter((bullet) => /^(responsible for|helped|worked on|assisted with|tasked with)\b/i.test(bullet));
+  const long = bullets.filter((bullet) => bullet.trim().split(/\s+/).length > 32);
+  const quantified = bullets.filter((bullet) => /\b\d+(?:\.\d+)?%?|\$\d|\b\d+\s*(?:hours?|days?|users?|clients?|teams?|regions?|hubs?)\b/i.test(bullet));
+  const normalized = bullets.map((bullet) => normalizeText(bullet).split(" ").slice(0, 7).join(" "));
+  if (weak.length) issues.push(`${weak.length} bullet${weak.length > 1 ? "s" : ""} start with weak phrasing.`);
+  if (long.length) issues.push(`${long.length} bullet${long.length > 1 ? "s are" : " is"} longer than 32 words.`);
+  if (bullets.length >= 4 && quantified.length / bullets.length < 0.2) issues.push("Fewer than 20% of bullets contain measurable scope or outcomes; add metrics only where truthful.");
+  if (new Set(normalized).size < normalized.length) issues.push("Two or more bullets begin with substantially repeated wording.");
+  if ((resume.summary || "").split(/\s+/).filter(Boolean).length > 55) issues.push("Summary exceeds 55 words.");
+  if (normalizeSkills(resume.skills).split(",").filter(Boolean).length > 24) issues.push("Skills section has more than 24 entries and may look keyword-stuffed.");
+  return issues;
 }
 function Row({ children }) { return <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>{children}</div>; }
 function SectionLabel({ children }) { return <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.6, textTransform: "uppercase", color: P.accentDeep, margin: "14px 0 8px" }}>{children}</div>; }
