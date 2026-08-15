@@ -427,7 +427,7 @@ export default function App() {
   const [editingResult, setEditingResult] = useState(false);
   const [regeneratingSection, setRegeneratingSection] = useState("");
   const [bgId, setBgId] = useState(() => loadLS("resumeTailor.bg", "forest"));
-  useEffect(() => saveLS("resumeTailor.bg", bgId), [bgId]);
+  useEffect(() => { saveLS("resumeTailor.bg", bgId); }, [bgId]);
   const bg = BACKGROUNDS.find((b) => b.id === bgId) || BACKGROUNDS[0];
   const cycleBg = () => { const i = BACKGROUNDS.findIndex((b) => b.id === bgId); setBgId(BACKGROUNDS[(i + 1) % BACKGROUNDS.length].id); };
   const jdFileRef = useRef();
@@ -439,9 +439,9 @@ export default function App() {
     sessionStorage.setItem(LS_KEY, apiKey);
     if (rememberKey) saveLS(LS_KEY, apiKey); else localStorage.removeItem(LS_KEY);
   }, [apiKey, rememberKey]);
-  useEffect(() => saveLS(LS_PROFILES, profiles), [profiles]);
-  useEffect(() => saveLS(LS_ACTIVE, activeId), [activeId]);
-  useEffect(() => saveLS(LS_HISTORY, history), [history]);
+  useEffect(() => { saveLS(LS_PROFILES, profiles); }, [profiles]);
+  useEffect(() => { saveLS(LS_ACTIVE, activeId); }, [activeId]);
+  useEffect(() => { saveLS(LS_HISTORY, history); }, [history]);
  
   // One-page check: a US-letter page minus ~1in margins ≈ 9.5in of content.
   // At 96dpi that's ~912px. The preview padding is 30px top+bottom (60px).
