@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeKeywordCoverage, normalizeProfile, normalizeTailoredResult, safeWebUrl } from "./App.jsx";
+import { computeKeywordCoverage, normalizeProfile, normalizeTailoredResult, parseResumeTextLocally, safeWebUrl } from "./App.jsx";
 
 describe("safeWebUrl", () => {
   it("normalizes normal web links", () => expect(safeWebUrl("github.com/example")).toBe("https://github.com/example"));
@@ -27,6 +27,14 @@ describe("normalizeProfile", () => {
   it("turns malformed AI fields into safe form values", () => {
     const profile = normalizeProfile({ name: { unexpected: true }, email: null, skills: ["SQL"], experience: "Real experience" }, "Test");
     expect(profile).toMatchObject({ name: "", email: "", skills: "", experience: "Real experience", _label: "Test" });
+  });
+});
+
+describe("local text resume parsing", () => {
+  it("extracts a structured text resume without an API call", () => {
+    const profile = parseResumeTextLocally("Jordan Lee\nData Analyst\njordan@example.com | +1 555-123-4567\n\nSKILLS\nSQL, Python\n\nEXPERIENCE\nData Analyst — Acme\n- Built reports");
+    expect(profile).toMatchObject({ name: "Jordan Lee", title: "Data Analyst", email: "jordan@example.com", skills: "SQL, Python" });
+    expect(profile.experience).toContain("Built reports");
   });
 });
 

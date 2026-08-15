@@ -20,6 +20,31 @@ export function normalizeProfile(value, label = "My profile") {
   const normalized = Object.fromEntries(Object.keys(DEFAULT_PROFILE).map((key) => [key, asString(source[key])]));
   return { ...normalized, _label: asString(source._label) || label };
 }
+export function parseResumeTextLocally(text) {
+  const raw = String(text || "").replace(/\r/g, "").trim();
+  const lines = raw.split("\n").map((line) => line.trim()).filter(Boolean);
+  const headings = new Set(["SUMMARY", "SKILLS", "EXPERIENCE", "PROJECTS", "EDUCATION", "CERTIFICATIONS"]);
+  const sections = {}; let current = "HEADER";
+  for (const line of lines) {
+    const upper = line.toUpperCase().replace(/:$/, "");
+    if (headings.has(upper)) { current = upper; sections[current] = []; }
+    else (sections[current] ||= []).push(line);
+  }
+  const header = sections.HEADER || [];
+  const joined = header.join(" | ");
+  const links = joined.match(/(?:https?:\/\/)?(?:www\.)?[a-z0-9.-]+\.[a-z]{2,}(?:\/[^\s|]*)?/gi) || [];
+  const findLink = (host) => links.find((link) => link.toLowerCase().includes(host)) || "";
+  return normalizeProfile({
+    name: header[0] || "", title: header[1] || "",
+    email: joined.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] || "",
+    phone: joined.match(/(?:\+?\d[\d ().-]{7,}\d)/)?.[0]?.trim() || "",
+    linkedin: findLink("linkedin.com"), github: findLink("github.com"),
+    website: links.find((link) => !/linkedin\.com|github\.com/i.test(link) && !joined.includes(`@${link}`)) || "",
+    summary: (sections.SUMMARY || []).join("\n"), skills: (sections.SKILLS || []).join(", "),
+    experience: (sections.EXPERIENCE || []).join("\n"), projects: (sections.PROJECTS || []).join("\n"),
+    education: (sections.EDUCATION || []).join("\n"), certifications: (sections.CERTIFICATIONS || []).join("\n"),
+  });
+}
  
 // Load the named-profile collection, migrating any legacy single profile on first run.
 function loadProfiles() {
@@ -108,8 +133,9 @@ ${certBody ? `\\section{Certifications}\n${certBody}\n` : ""}
  
 // ─── Gemini ──────────────────────────────────────────────────────────────────
 const GEMINI_MODEL = import.meta.env.VITE_GEMINI_MODEL || "gemini-3.5-flash";
-const geminiURL = () => `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
-async function geminiCall(key, parts, generationConfig) {
+const GEMINI_FAST_MODEL = import.meta.env.VITE_GEMINI_FAST_MODEL || "gemini-3.5-flash-lite";
+const geminiURL = (model) => `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+async function geminiCall(key, parts, generationConfig, model = GEMINI_MODEL) {
   const body = { contents: [{ role: "user", parts }] };
   if (generationConfig) body.generationConfig = generationConfig;
   const maxAttempts = 4;
@@ -119,10 +145,14 @@ async function geminiCall(key, parts, generationConfig) {
     const timer = setTimeout(() => ctrl.abort(), 60000);
     let res;
     try {
-      res = await fetch(geminiURL(), {
+      const requestBody = JSON.stringify(body);
+      const useRelay = location.hostname.endsWith("vercel.app") && requestBody.length < 3_000_000;
+      res = await fetch(useRelay ? "/api/gemini" : geminiURL(model), {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": key },
-        body: JSON.stringify(body),
+        headers: useRelay
+          ? { "Content-Type": "application/json", "x-gemini-key": key, "x-gemini-model": model }
+          : { "Content-Type": "application/json", "x-goog-api-key": key },
+        body: requestBody,
         signal: ctrl.signal,
       });
     } catch (e) {
@@ -183,13 +213,13 @@ const FAST_JSON_CFG = { responseMimeType: "application/json", thinkingConfig: { 
 const FAST_CFG = { thinkingConfig: { thinkingLevel: "minimal" } };
  
 async function extractJDFromImage(key, base64, mimeType) {
-  return geminiCall(key, [{ inline_data: { mime_type: mimeType, data: base64 } }, { text: "Extract the full job description text from this screenshot. Return only the raw text, no commentary." }], FAST_CFG);
+  return geminiCall(key, [{ inline_data: { mime_type: mimeType, data: base64 } }, { text: "Extract the full job description text from this screenshot. Return only the raw text, no commentary." }], FAST_CFG, GEMINI_FAST_MODEL);
 }
 async function extractJDFromImages(key, images) {
   // images: [{ data, mimeType }] — multiple screenshots of ONE posting (scrolled).
   const parts = images.map((img) => ({ inline_data: { mime_type: img.mimeType, data: img.data } }));
   parts.push({ text: `These ${images.length} screenshots are parts of ONE job posting, in order (e.g. a long page scrolled top to bottom). Stitch them into a single continuous job description. Remove duplicated/overlapping text where the screenshots overlap. Return only the raw job description text, no commentary.` });
-  return geminiCall(key, parts, FAST_CFG);
+  return geminiCall(key, parts, FAST_CFG, GEMINI_FAST_MODEL);
 }
 async function parseResumeToProfile(key, text) {
   const prompt = `Extract this resume text into a structured profile. Copy contact details (name, email, phone, links) EXACTLY as they appear in the text — never reformat, complete, or "professionalize" an email or any contact field. If a field is absent, leave it as an empty string. Return ONLY valid JSON (no markdown):
@@ -197,7 +227,7 @@ async function parseResumeToProfile(key, text) {
  
 RESUME TEXT:
 ${text}`;
-  return safeParse(await geminiCall(key, [{ text: prompt }], FAST_JSON_CFG), "Resume parsing");
+  return safeParse(await geminiCall(key, [{ text: prompt }], FAST_JSON_CFG, GEMINI_FAST_MODEL), "Resume parsing");
 }
 async function tailorResume(key, profile, jd, customPrompt = "") {
   const prompt = `You are an expert ATS resume writer. Given a candidate's raw profile and a target job description, produce a tailored, ATS-friendly resume. Rewrite experience/project bullets to emphasize achievements and keywords relevant to the job (strong action verbs). Reorder skills so the most job-relevant come first.
@@ -497,11 +527,12 @@ export default function App() {
         parsed = await parseResumeToProfile(apiKey, text);
       } else if (file.type === "application/pdf") {
         const base64 = await fileToBase64(file);
-        const raw = await geminiCall(apiKey, [{ inline_data: { mime_type: "application/pdf", data: base64 } }, { text: "Extract all text from this resume PDF, raw text only." }], FAST_CFG);
+        const raw = await geminiCall(apiKey, [{ inline_data: { mime_type: "application/pdf", data: base64 } }, { text: "Extract all text from this resume PDF, raw text only." }], FAST_CFG, GEMINI_FAST_MODEL);
         parsed = await parseResumeToProfile(apiKey, raw);
       } else {
         const text = await file.text();
-        parsed = await parseResumeToProfile(apiKey, text);
+        const local = parseResumeTextLocally(text);
+        parsed = local.email && local.experience ? local : await parseResumeToProfile(apiKey, text);
       }
       const cleaned = normalizeProfile(parsed, mode === "me" ? activeProfile._label : "Someone else");
       if (mode === "me") setActiveProfileFull(cleaned); else setOtherProfile(cleaned);
@@ -517,16 +548,8 @@ export default function App() {
     if (jd.trim().length < 120) {
       if (!window.confirm("That job description looks quite short — the scores and gap analysis work best with the full posting. Generate anyway?")) return;
     }
-    setLoading(true); setStatus("Checking the job description…"); setCoverLetter("");
-    try {
-      const check = await classifyJD(apiKey, jd);
-      if (check && check.isJobDescription === false) {
-        setLoading(false);
-        setStatus(`That doesn't look like a job description — it looks like ${check.whatItIs || "something else"}. Paste the actual job posting (responsibilities, requirements, qualifications) and try again.`);
-        return;
-      }
-    } catch { /* if the check itself fails, don't block generation */ }
-    setStatus("Tailoring the resume… (retries automatically if Gemini is busy)");
+    setLoading(true); setCoverLetter("");
+    setStatus("Tailoring the resume…");
     try {
       const tailored = normalizeTailoredResult(await tailorResume(apiKey, profile, jd, customPrompt));
       setStatus("Fact-checking every generated claim…");
@@ -658,7 +681,7 @@ export default function App() {
           <label style={{ display: "inline-flex", gap: 7, alignItems: "center", marginTop: 9, color: P.muted, fontSize: 11.5 }}>
             <input type="checkbox" checked={rememberKey} onChange={(e) => setRememberKey(e.target.checked)} /> Remember key after I close this tab
           </label>
-          <div style={{ color: P.faint, fontSize: 11, marginTop: 5 }}>Your resume, job description, and key are sent directly to Google Gemini when you generate. No paid server is used.</div>
+          <div style={{ color: P.faint, fontSize: 11, marginTop: 5 }}>Your resume, job description, and key are relayed securely to Google Gemini and are not stored by this app. No paid server is used.</div>
         </div>
  
         <div role="tablist" aria-label="Resume workflow" style={{ display: "flex", gap: 8, margin: "16px 0", flexWrap: "wrap" }}>
@@ -987,7 +1010,7 @@ export default function App() {
           </div>
         )}
  
-        <p style={{ textAlign: "center", color: P.muted, fontSize: 11.5, marginTop: 30 }}>Your data stays in your browser except requests to Google's Gemini API. No server, no tracking.</p>
+        <p style={{ textAlign: "center", color: P.muted, fontSize: 11.5, marginTop: 30 }}>Saved data stays in your browser. AI requests are relayed to Google Gemini without storage. No tracking.</p>
       </div>
     </div>
   );

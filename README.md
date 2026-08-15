@@ -26,7 +26,7 @@ Paste a job description (or upload a screenshot of one) and the app uses AI to r
 
 ## Privacy
 
-There is no backend and no database. Your profile and history are stored only in your browser. The API key is session-only by default; you can explicitly choose to remember it. Resume and job content is sent directly to Google's Gemini API when you generate. Nothing is tracked by this app.
+There is no database. Your profile and history are stored only in your browser. The API key is session-only by default; you can explicitly choose to remember it. On the deployed app, AI requests are relayed by a stateless Vercel function to avoid browser network failures; the function does not store the key or content. Nothing is tracked by this app.
 
 ---
 
