@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
+import "./App.css";
  
 // ─── Persistence (localStorage) ─────────────────────────────────────────────
 const LS_KEY = "resumeTailor.apiKey"; // legacy/opt-in persistent key
@@ -1099,19 +1100,29 @@ export default function App() {
         )}
 
         {tab === "applications" && (
-          <div style={glassCard}>
-            <SectionLabel>Application tracker</SectionLabel>
-            {applications.length === 0 ? <p style={{ color: P.muted, fontSize: 13 }}>No applications tracked yet. Add one from a generated result.</p> : applications.map((item) => (
-              <div key={item.id} style={{ border: `1px solid ${P.glassBorder}`, background: P.field, borderRadius: 12, padding: 12, marginBottom: 9 }}>
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-                  <input aria-label="Company" value={item.company} placeholder="Company" onChange={(e) => updateApplication(item.id, "company", e.target.value)} style={{ flex: "1 1 140px", padding: 7, borderRadius: 8 }} />
-                  <input aria-label="Role" value={item.role} placeholder="Role" onChange={(e) => updateApplication(item.id, "role", e.target.value)} style={{ flex: "2 1 220px", padding: 7, borderRadius: 8 }} />
-                  <select aria-label="Application status" value={item.status} onChange={(e) => updateApplication(item.id, "status", e.target.value)} style={{ padding: 7, borderRadius: 8 }}>{["Preparing", "Applied", "Interview", "Offer", "Rejected", "Withdrawn"].map((status) => <option key={status}>{status}</option>)}</select>
-                  <input aria-label="Application date" type="date" value={item.date} onChange={(e) => updateApplication(item.id, "date", e.target.value)} style={{ padding: 7, borderRadius: 8 }} />
-                  <button style={{ ...tabBtn(false), color: P.danger, padding: "6px 10px" }} onClick={() => setApplications((items) => items.filter((app) => app.id !== item.id))}>Delete</button>
+          <div style={glassCard} className="tracker-shell">
+            <div className="tracker-heading">
+              <div><SectionLabel>Application tracker</SectionLabel><p>Keep every opportunity and next step in one place.</p></div>
+              <span className="tracker-total">{applications.length} {applications.length === 1 ? "application" : "applications"}</span>
+            </div>
+            {applications.length > 0 && <div className="tracker-summary" aria-label="Application status summary">
+              {["Preparing", "Applied", "Interview", "Offer"].map((status) => <div className={`tracker-stat status-${status.toLowerCase()}`} key={status}><strong>{applications.filter((item) => item.status === status).length}</strong><span>{status}</span></div>)}
+            </div>}
+            {applications.length === 0 ? <div className="tracker-empty"><span aria-hidden="true">◎</span><strong>No applications yet</strong><p>Generate a tailored resume, then choose “Track application.”</p></div> : applications.map((item) => (
+              <article key={item.id} className="application-card">
+                <div className="application-card-top">
+                  <div className="application-identity"><span className="company-mark" aria-hidden="true">{(item.company || item.role || "?").trim().charAt(0).toUpperCase()}</span><div><strong>{item.role || "Untitled role"}</strong><span>{item.company || "Add company"}</span></div></div>
+                  <span className={`application-stage status-${item.status.toLowerCase()}`}>{item.status}</span>
                 </div>
-                <textarea aria-label="Application notes" value={item.notes} onChange={(e) => updateApplication(item.id, "notes", e.target.value)} placeholder="Contact, next step, interview notes…" rows={2} style={{ width: "100%", marginTop: 8, padding: 8, borderRadius: 8, boxSizing: "border-box" }} />
-              </div>
+                <div className="application-fields">
+                  <label><span>Company</span><input aria-label="Company" value={item.company} placeholder="Company name" onChange={(e) => updateApplication(item.id, "company", e.target.value)} /></label>
+                  <label><span>Role</span><input aria-label="Role" value={item.role} placeholder="Job title" onChange={(e) => updateApplication(item.id, "role", e.target.value)} /></label>
+                  <label><span>Status</span><select aria-label="Application status" value={item.status} onChange={(e) => updateApplication(item.id, "status", e.target.value)}>{["Preparing", "Applied", "Interview", "Offer", "Rejected", "Withdrawn"].map((status) => <option key={status}>{status}</option>)}</select></label>
+                  <label><span>Date</span><input aria-label="Application date" type="date" value={item.date} onChange={(e) => updateApplication(item.id, "date", e.target.value)} /></label>
+                </div>
+                <label className="application-notes"><span>Notes & next step</span><textarea aria-label="Application notes" value={item.notes} onChange={(e) => updateApplication(item.id, "notes", e.target.value)} placeholder="Recruiter contact, follow-up date, interview notes…" rows={2} /></label>
+                <div className="application-actions">{typeof item.matchScore === "number" && <span>Resume match <strong>{item.matchScore}%</strong></span>}<button className="application-delete" onClick={() => setApplications((items) => items.filter((app) => app.id !== item.id))}>Delete application</button></div>
+              </article>
             ))}
           </div>
         )}
