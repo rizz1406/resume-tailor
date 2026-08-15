@@ -32,7 +32,7 @@ export function parseResumeTextLocally(text) {
   }
   const header = sections.HEADER || [];
   const joined = header.join(" | ");
-  const links = joined.match(/(?:https?:\/\/)?(?:www\.)?[a-z0-9.-]+\.[a-z]{2,}(?:\/[^\s|]*)?/gi) || [];
+  const links = header.flatMap((line) => line.split("|")).map((token) => token.trim()).filter((token) => !token.includes("@") && /^(?:https?:\/\/)?(?:www\.)?[a-z0-9.-]+\.[a-z]{2,}(?:\/\S*)?$/i.test(token));
   const findLink = (host) => links.find((link) => link.toLowerCase().includes(host)) || "";
   return normalizeProfile({
     name: header[0] || "", title: header[1] || "",
@@ -101,9 +101,7 @@ function buildLatex(r) {
     `\\textbf{${esc(ed.degree || "")}} \\hfill ${esc(ed.dates || "")}\\\\\n\\textit{${esc(ed.school || "")}${ed.location ? ", " + esc(ed.location) : ""}}`
   ).join("\\\\[3pt]\n");
   const certBody = (r.certificationsStructured || []).length
-    ? "\\begin{itemize}[leftmargin=1.2em, itemsep=1pt, topsep=2pt, parsep=0pt]\n" +
-      r.certificationsStructured.map((c) => `  \\item ${c.link ? `\\href{${esc(urlize(c.link))}}{${esc(c.name || "")}}` : esc(c.name || "")}`).join("\n") +
-      "\n\\end{itemize}"
+    ? r.certificationsStructured.map((c) => c.link ? `\\href{${esc(urlize(c.link))}}{${esc(c.name || "")}}` : esc(c.name || "")).join("\\\\[2pt]\n")
     : (r.certifications ? esc(r.certifications) : "");
   const plain = (title, body) => body && body.trim() ? `\\section{${esc(title)}}\n${esc(body)}\n` : "";
   return `\\documentclass[11pt,letterpaper]{article}
@@ -190,13 +188,14 @@ function safeParse(t, ctx) {
 }
 const asString = (v) => typeof v === "string" ? v : "";
 const asStrings = (v) => Array.isArray(v) ? v.filter((x) => typeof x === "string").slice(0, 50) : [];
+export const normalizeSkills = (value) => [...new Set(asString(value).split(/[,;\n•]+/).map((skill) => skill.trim()).filter(Boolean))].join(", ");
 const clampScore = (v) => Number.isFinite(Number(v)) ? Math.max(0, Math.min(100, Math.round(Number(v)))) : null;
 export function normalizeTailoredResult(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Resume tailoring: incomplete AI response. Try again.");
   const rows = (key, mapper, max = 12) => Array.isArray(raw[key]) ? raw[key].slice(0, max).map(mapper) : [];
   return {
     ...raw,
-    summary: asString(raw.summary), skills: asString(raw.skills),
+    summary: asString(raw.summary), skills: normalizeSkills(raw.skills),
     experienceStructured: rows("experienceStructured", (e = {}) => ({ role: asString(e.role), company: asString(e.company), location: asString(e.location), dates: asString(e.dates), bullets: asStrings(e.bullets).slice(0, 6) })),
     projectsStructured: rows("projectsStructured", (p = {}) => ({ name: asString(p.name), tech: asString(p.tech), link: safeWebUrl(p.link), bullets: asStrings(p.bullets).slice(0, 5) })),
     educationStructured: rows("educationStructured", (e = {}) => ({ degree: asString(e.degree), school: asString(e.school), location: asString(e.location), dates: asString(e.dates) })),
@@ -209,8 +208,22 @@ export function normalizeTailoredResult(raw) {
 }
 // Minimal-thinking + JSON mode for cheap, fast, parseable extraction calls.
 const JSON_CFG = { responseMimeType: "application/json" };
+const TAILOR_CFG = { responseMimeType: "application/json", thinkingConfig: { thinkingLevel: "low" } };
 const FAST_JSON_CFG = { responseMimeType: "application/json", thinkingConfig: { thinkingLevel: "minimal" } };
 const FAST_CFG = { thinkingConfig: { thinkingLevel: "minimal" } };
+const AUDIT_CFG = {
+  responseMimeType: "application/json",
+  thinkingConfig: { thinkingLevel: "minimal" },
+  responseSchema: {
+    type: "OBJECT",
+    properties: {
+      unsupportedClaims: { type: "ARRAY", items: { type: "STRING" } },
+      qualityIssues: { type: "ARRAY", items: { type: "STRING" } },
+      verdict: { type: "STRING", enum: ["pass", "review"] },
+    },
+    required: ["unsupportedClaims", "qualityIssues", "verdict"],
+  },
+};
  
 async function extractJDFromImage(key, base64, mimeType) {
   return geminiCall(key, [{ inline_data: { mime_type: mimeType, data: base64 } }, { text: "Extract the full job description text from this screenshot. Return only the raw text, no commentary." }], FAST_CFG, GEMINI_FAST_MODEL);
@@ -244,6 +257,10 @@ HARD CONSTRAINTS (must obey):
 - ONE PAGE ONLY. The final resume MUST fit on a single US-letter page at 11pt. Be ruthless: keep the summary to 2 lines, cap each role at 3-4 bullets, drop the least-relevant roles/projects entirely if needed, and keep bullets to roughly one line each. Prefer fewer, stronger, high-impact bullets over completeness.
 - Plain ATS-safe content only: no tables, no columns, no graphics, standard section names.
 - Prioritize strictly by relevance to the job description; cut anything that doesn't earn its space.
+- Keep the Skills section as a clean comma-separated list, never bullets, prose, ratings, or keyword stuffing.
+- Use bullets for achievements under Experience and Projects. Start each with a strong verb, keep it concise, and preserve every stated metric exactly.
+- Never estimate or recalculate years of experience. If the profile states a number of years, repeat that exact number or omit years entirely.
+- Keep matchVerdictReason factual and professional. Never speculate that a hiring manager will "bend" requirements, mentor the candidate into a title, or make an exception.
  
 For projects and certifications, if the source profile contains a URL for an item, put it in the "link" field; otherwise leave "link" empty.
  
@@ -286,7 +303,7 @@ ${JSON.stringify(profile, null, 2)}
  
 TARGET JOB DESCRIPTION:
 ${jd}`;
-  return safeParse(await geminiCall(key, [{ text: prompt }], JSON_CFG), "Resume tailoring");
+  return safeParse(await geminiCall(key, [{ text: prompt }], TAILOR_CFG), "Resume tailoring");
 }
 async function auditTailoredResume(key, profile, resume) {
   const prompt = `Act as a strict resume fact checker. Compare every claim in the GENERATED RESUME against the SOURCE PROFILE. A claim is supported only when the source explicitly states it or it is a faithful rephrasing. Flag invented skills, tools, employers, titles, dates, degrees, certifications, projects, responsibilities, and especially invented or inflated metrics. Also flag vague or awkward writing that should be reviewed. Do not reward keyword matching and do not assume facts.
@@ -299,7 +316,7 @@ ${JSON.stringify(profile, null, 2)}
 
 GENERATED RESUME:
 ${JSON.stringify(resume, null, 2)}`;
-  const raw = safeParse(await geminiCall(key, [{ text: prompt }], JSON_CFG), "Quality review");
+  const raw = safeParse(await geminiCall(key, [{ text: prompt }], AUDIT_CFG, GEMINI_FAST_MODEL), "Quality review");
   const unsupportedClaims = asStrings(raw?.unsupportedClaims).slice(0, 20);
   const qualityIssues = asStrings(raw?.qualityIssues).slice(0, 20);
   return { unsupportedClaims, qualityIssues, verdict: unsupportedClaims.length ? "review" : "pass" };
@@ -552,18 +569,22 @@ export default function App() {
     setStatus("Tailoring the resume…");
     try {
       const tailored = normalizeTailoredResult(await tailorResume(apiKey, profile, jd, customPrompt));
-      setStatus("Fact-checking every generated claim…");
-      try {
-        tailored.qualityReview = await auditTailoredResume(apiKey, profile, tailored);
-        tailored.fabricationWarnings = [...new Set([...(tailored.fabricationWarnings || []), ...tailored.qualityReview.unsupportedClaims])];
-      } catch (auditError) {
-        tailored.qualityReview = { verdict: "unavailable", unsupportedClaims: [], qualityIssues: [], error: auditError.message };
-      }
       const merged = { name: profile.name, title: profile.title, email: profile.email, phone: profile.phone, location: profile.location, linkedin: profile.linkedin, github: profile.github, website: profile.website, ...tailored };
-      merged.keywordCoverage = computeKeywordCoverage(merged, jd); // real, reproducible
-      const t = buildLatex(merged);
-      setResult(merged); setTex(t); setTab("result"); setStatus("Done — review, then download.");
-      setHistory((h) => [{ id: uid(), label: jobLabel || deriveLabel(jd), person: mode === "me" ? (activeProfile._label || "Me") : (profile.name || "Someone else"), date: new Date().toISOString(), jd, result: merged, tex: t }, ...h].slice(0, 20));
+      merged.keywordCoverage = computeKeywordCoverage(merged, jd);
+      let t = buildLatex(merged);
+      const entryId = uid();
+      setResult(merged); setTex(t); setTab("result"); setLoading(false);
+      setStatus("Resume ready — running a quick fact-check in the background…");
+      setHistory((h) => [{ id: entryId, label: jobLabel || deriveLabel(jd), person: mode === "me" ? (activeProfile._label || "Me") : (profile.name || "Someone else"), date: new Date().toISOString(), jd, result: merged, tex: t }, ...h].slice(0, 20));
+      try {
+        merged.qualityReview = await auditTailoredResume(apiKey, profile, merged);
+        merged.fabricationWarnings = [...new Set([...(merged.fabricationWarnings || []), ...merged.qualityReview.unsupportedClaims])];
+      } catch (auditError) {
+        merged.qualityReview = { verdict: "unavailable", unsupportedClaims: [], qualityIssues: [], error: auditError.message };
+      }
+      t = buildLatex(merged);
+      setResult({ ...merged }); setTex(t); setStatus("Done — review, then download.");
+      setHistory((h) => h.map((entry) => entry.id === entryId ? { ...entry, result: merged, tex: t } : entry));
     } catch (err) { setStatus("Generation failed: " + err.message); }
     finally { setLoading(false); }
   }
@@ -627,6 +648,15 @@ export default function App() {
       await html2pdf().set({ margin: [0.5, 0.55, 0.5, 0.55], filename: `${(result?.name || "resume").replace(/\s+/g, "_")}.pdf`, image: { type: "jpeg", quality: 0.98 }, html2canvas: { scale: 2, useCORS: true }, jsPDF: { unit: "in", format: "letter", orientation: "portrait" }, enableLinks: true }).from(previewRef.current).save();
       setStatus("PDF downloaded.");
     } catch (err) { setStatus("PDF failed: " + err.message); }
+  }
+  function printAtsPdf() {
+    if (!result) return;
+    const popup = window.open("", "_blank");
+    if (!popup) { setStatus("Allow pop-ups, then try ATS PDF again."); return; }
+    popup.opener = null;
+    popup.document.write(`<!doctype html><html><head><title>${String(result.name || "Resume").replace(/[<>]/g, "")}</title><meta charset="utf-8"><style>@page{size:letter;margin:.5in}*{box-sizing:border-box}body{font-family:Arial,Helvetica,sans-serif;color:#111;font-size:10pt;line-height:1.35;margin:0}a{color:#111!important;text-decoration:none}h2{break-after:avoid}li,div{break-inside:avoid}@media print{button{display:none}}</style></head><body>${renderResumeInner(result)}<script>window.onload=()=>setTimeout(()=>window.print(),150)<\/script></body></html>`);
+    popup.document.close();
+    setStatus("Print dialog opened — choose ‘Save as PDF’. This version keeps selectable ATS-readable text.");
   }
  
   const tabBtn = (active, extra = {}) => ({ padding: "7px 15px", fontSize: 13, fontWeight: 600, fontFamily: font, border: `1px solid ${active ? "transparent" : P.glassBorder}`, background: active ? "linear-gradient(135deg,#8b6bff,#a855f7)" : P.glassHi, color: active ? "#fff" : P.ink, borderRadius: 11, cursor: "pointer", backdropFilter: "blur(8px)", WebkitBackdropFilter: "blur(8px)", ...extra });
@@ -900,7 +930,8 @@ export default function App() {
               </div>
             )}
             <div style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
-              <button style={{ ...tabBtn(true), padding: "10px 18px" }} onClick={downloadPdf}>⬇ PDF</button>
+              <button style={{ ...tabBtn(true), padding: "10px 18px" }} onClick={printAtsPdf}>⬇ ATS PDF</button>
+              <button title="Convenient visual export; ATS PDF is safer for applications" style={{ ...tabBtn(false), padding: "10px 18px" }} onClick={downloadPdf}>Visual PDF</button>
               <button style={{ ...tabBtn(false), padding: "10px 18px" }} onClick={downloadTex}>⬇ .tex</button>
               <button style={{ ...tabBtn(false), padding: "10px 18px", opacity: clLoading ? 0.6 : 1 }} onClick={genCoverLetter} disabled={clLoading}>{clLoading ? "Writing…" : "✦ Cover letter"}</button>
               <a href="https://www.overleaf.com" target="_blank" rel="noreferrer" style={{ ...tabBtn(false), padding: "10px 18px", textDecoration: "none", display: "inline-block" }}>Overleaf ↗</a>
@@ -1147,7 +1178,7 @@ function renderResumeInner(r) {
   const proj = (r.projectsStructured || []).map((p) => { const nm = p.link ? link(p.link, p.name) : `<strong>${e2(p.name)}</strong>`; const nmb = p.link ? `<strong>${nm}</strong>` : nm; return `<div style="margin-bottom:6px">${nmb}${p.tech ? ` <span style="color:#555">(${e2(p.tech)})</span>` : ""}<ul style="margin:3px 0 0;padding-left:18px">${(p.bullets || []).map((b) => `<li>${e2(b)}</li>`).join("")}</ul></div>`; }).join("");
   const edu = (r.educationStructured || []).map((e) => `<div style="display:flex;justify-content:space-between"><span><strong>${e2(e.degree)}</strong>, ${e2(e.school)}${e.location ? ", " + e2(e.location) : ""}</span><span>${e2(e.dates)}</span></div>`).join("");
   const certs = (r.certificationsStructured || []).length
-    ? `<ul style="margin:0;padding-left:18px">${r.certificationsStructured.map((c) => `<li>${c.link ? link(c.link, c.name) : e2(c.name)}</li>`).join("")}</ul>`
+    ? r.certificationsStructured.map((c) => `<div style="margin-bottom:2px">${c.link ? link(c.link, c.name) : e2(c.name)}</div>`).join("")
     : (r.certifications ? `<div>${e2(r.certifications)}</div>` : "");
   return `<div style="text-align:center;margin-bottom:8px"><div style="font-size:20px;font-weight:800">${e2(r.name)}</div>${r.title ? `<div style="font-size:13px">${e2(r.title)}</div>` : ""}<div style="font-size:11px;color:#333;margin-top:3px">${contactParts.join(" &bull; ")}</div></div>${sec("Summary", r.summary ? `<div>${e2(r.summary)}</div>` : "")}${sec("Skills", r.skills ? `<div>${e2(r.skills)}</div>` : "")}${sec("Experience", exp)}${sec("Projects", proj)}${sec("Education", edu)}${sec("Certifications", certs)}`;
 }

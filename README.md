@@ -15,13 +15,14 @@ Paste a job description (or upload a screenshot of one) and the app uses AI to r
 - **ATS match score** — a 0–100 fit estimate, a list of keywords you cover, and a list of keywords you're missing so you know where the gaps are.
 - **Cover letter generator** — a tailored ~200-word letter from your profile and the job, one click.
 - **Clickable links** — email, LinkedIn, GitHub, and website in the header, plus per-project repo links and per-certification verification links, all live in the exported PDF.
-- **PDF + LaTeX export** — a reliable in-browser PDF with working links, plus a `.tex` file for compiling the true LaTeX version in Overleaf.
+- **ATS PDF + LaTeX export** — a selectable-text browser PDF for applications, an optional visual PDF, and a `.tex` file for Overleaf.
 - **Saved profile** — fill your details once (or auto-fill from an existing resume) and they load automatically every visit.
 - **"Me" vs "Someone else" mode** — keep your own master profile, or make a resume for someone else without touching yours.
 - **History** — every generated resume is saved per job, reopenable anytime.
 - **Independent fact-check** — a second AI pass checks generated claims against the source profile before export.
 - **Editable results** — revise summaries, skills, and bullets or improve one section without regenerating everything.
 - **Backup & restore** — export profiles and history to a local JSON file and restore them later.
+- **Fast perceived results** — structured text resumes parse locally, and the tailored resume appears before the independent fact-check finishes.
 - **Liquid-glass UI** — frosted panels over switchable nature-photo backgrounds, with an SVG displacement refraction effect.
 
 ## Privacy

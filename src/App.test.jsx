@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeKeywordCoverage, normalizeProfile, normalizeTailoredResult, parseResumeTextLocally, safeWebUrl } from "./App.jsx";
+import { computeKeywordCoverage, normalizeProfile, normalizeSkills, normalizeTailoredResult, parseResumeTextLocally, safeWebUrl } from "./App.jsx";
 
 describe("safeWebUrl", () => {
   it("normalizes normal web links", () => expect(safeWebUrl("github.com/example")).toBe("https://github.com/example"));
@@ -35,6 +35,13 @@ describe("local text resume parsing", () => {
     const profile = parseResumeTextLocally("Jordan Lee\nData Analyst\njordan@example.com | +1 555-123-4567\n\nSKILLS\nSQL, Python\n\nEXPERIENCE\nData Analyst — Acme\n- Built reports");
     expect(profile).toMatchObject({ name: "Jordan Lee", title: "Data Analyst", email: "jordan@example.com", skills: "SQL, Python" });
     expect(profile.experience).toContain("Built reports");
+    expect(profile.website).toBe("");
+  });
+});
+
+describe("ATS skill formatting", () => {
+  it("normalizes bullets, semicolons, duplicates, and newlines to commas", () => {
+    expect(normalizeSkills("SQL; Python\nPower BI, SQL")).toBe("SQL, Python, Power BI");
   });
 });
 
