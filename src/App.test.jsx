@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeKeywordCoverage, normalizeTailoredResult, safeWebUrl } from "./App.jsx";
+import { computeKeywordCoverage, normalizeProfile, normalizeTailoredResult, safeWebUrl } from "./App.jsx";
 
 describe("safeWebUrl", () => {
   it("normalizes normal web links", () => expect(safeWebUrl("github.com/example")).toBe("https://github.com/example"));
@@ -20,6 +20,13 @@ describe("normalizeTailoredResult", () => {
     expect(result.matchVerdict).toBe("moderate");
     expect(result.experienceStructured[0].bullets).toEqual(["Built reports"]);
     expect(result.projectsStructured[0].link).toBe("");
+  });
+});
+
+describe("normalizeProfile", () => {
+  it("turns malformed AI fields into safe form values", () => {
+    const profile = normalizeProfile({ name: { unexpected: true }, email: null, skills: ["SQL"], experience: "Real experience" }, "Test");
+    expect(profile).toMatchObject({ name: "", email: "", skills: "", experience: "Real experience", _label: "Test" });
   });
 });
 

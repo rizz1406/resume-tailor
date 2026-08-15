@@ -15,11 +15,18 @@ const DEFAULT_PROFILE = {
   linkedin: "", github: "", website: "",
   skills: "", experience: "", projects: "", education: "", certifications: "",
 };
+export function normalizeProfile(value, label = "My profile") {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const normalized = Object.fromEntries(Object.keys(DEFAULT_PROFILE).map((key) => [key, asString(source[key])]));
+  return { ...normalized, _label: asString(source._label) || label };
+}
  
 // Load the named-profile collection, migrating any legacy single profile on first run.
 function loadProfiles() {
   const existing = loadLS(LS_PROFILES, null);
-  if (existing && Object.keys(existing).length) return existing;
+  if (existing && typeof existing === "object" && !Array.isArray(existing) && Object.keys(existing).length) {
+    return Object.fromEntries(Object.entries(existing).filter(([, value]) => value && typeof value === "object").map(([id, value]) => [id, normalizeProfile(value)]));
+  }
   const legacy = loadLS(LS_PROFILE, null);
   const id = uid();
   const seed = legacy && (legacy.name || legacy.experience)
@@ -496,7 +503,7 @@ export default function App() {
         const text = await file.text();
         parsed = await parseResumeToProfile(apiKey, text);
       }
-      const cleaned = { ...DEFAULT_PROFILE, ...parsed };
+      const cleaned = normalizeProfile(parsed, mode === "me" ? activeProfile._label : "Someone else");
       if (mode === "me") setActiveProfileFull(cleaned); else setOtherProfile(cleaned);
       setStatus("Filled from your resume — review the fields, tweak anything, then add a job.");
     } catch (err) { setStatus("Couldn't parse resume: " + err.message); }
