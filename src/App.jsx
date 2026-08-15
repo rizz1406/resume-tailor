@@ -13,11 +13,14 @@ const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 
 const DEFAULT_PROFILE = {
   name: "", title: "", email: "", phone: "", location: "",
   linkedin: "", github: "", website: "",
-  skills: "", experience: "", projects: "", education: "", certifications: "",
+  summary: "", skills: "", experience: "", projects: "", education: "", certifications: "",
 };
 export function normalizeProfile(value, label = "My profile") {
   const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
   const normalized = Object.fromEntries(Object.keys(DEFAULT_PROFILE).map((key) => [key, asString(source[key])]));
+  const emailLocal = normalized.email.split("@")[0]?.toLowerCase();
+  const websiteHost = normalized.website.replace(/^https?:\/\//i, "").replace(/\/$/, "").toLowerCase();
+  if (emailLocal && websiteHost === emailLocal) normalized.website = "";
   return { ...normalized, _label: asString(source._label) || label };
 }
 export function parseResumeTextLocally(text) {
@@ -32,12 +35,14 @@ export function parseResumeTextLocally(text) {
   }
   const header = sections.HEADER || [];
   const joined = header.join(" | ");
+  const contactTokens = header.flatMap((line) => line.split("|")).map((token) => token.trim()).filter(Boolean);
   const links = header.flatMap((line) => line.split("|")).map((token) => token.trim()).filter((token) => !token.includes("@") && /^(?:https?:\/\/)?(?:www\.)?[a-z0-9.-]+\.[a-z]{2,}(?:\/\S*)?$/i.test(token));
   const findLink = (host) => links.find((link) => link.toLowerCase().includes(host)) || "";
   return normalizeProfile({
     name: header[0] || "", title: header[1] || "",
     email: joined.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] || "",
     phone: joined.match(/(?:\+?\d[\d ().-]{7,}\d)/)?.[0]?.trim() || "",
+    location: contactTokens.find((token) => token.includes(",") && !/@|https?:|linkedin|github/i.test(token) && !/\d{3}[- )]/.test(token)) || "",
     linkedin: findLink("linkedin.com"), github: findLink("github.com"),
     website: links.find((link) => !/linkedin\.com|github\.com/i.test(link) && !joined.includes(`@${link}`)) || "",
     summary: (sections.SUMMARY || []).join("\n"), skills: (sections.SKILLS || []).join(", "),
@@ -77,15 +82,16 @@ export function safeWebUrl(value = "") {
   } catch { return ""; }
 }
 const urlize = safeWebUrl;
+const displayWebUrl = (value) => safeWebUrl(value).replace(/^https?:\/\//i, "").replace(/\/$/, "");
  
 function buildLatex(r) {
   const contactBits = [
     r.email && `\\href{mailto:${esc(r.email)}}{${esc(r.email)}}`,
     r.phone && esc(r.phone),
     r.location && esc(r.location),
-    safeWebUrl(r.linkedin) && `\\href{${esc(safeWebUrl(r.linkedin))}}{LinkedIn}`,
-    safeWebUrl(r.github) && `\\href{${esc(safeWebUrl(r.github))}}{GitHub}`,
-    safeWebUrl(r.website) && `\\href{${esc(safeWebUrl(r.website))}}{Website}`,
+    safeWebUrl(r.linkedin) && `\\href{${esc(safeWebUrl(r.linkedin))}}{${esc(displayWebUrl(r.linkedin))}}`,
+    safeWebUrl(r.github) && `\\href{${esc(safeWebUrl(r.github))}}{${esc(displayWebUrl(r.github))}}`,
+    safeWebUrl(r.website) && `\\href{${esc(safeWebUrl(r.website))}}{${esc(displayWebUrl(r.website))}}`,
   ].filter(Boolean);
   const bulletList = (items) => items && items.length
     ? `\\begin{itemize}[leftmargin=1.2em, itemsep=1pt, topsep=2pt, parsep=0pt]\n${items.map((b) => `  \\item ${esc(b)}`).join("\n")}\n\\end{itemize}` : "";
@@ -260,6 +266,7 @@ HARD CONSTRAINTS (must obey):
 - Keep the Skills section as a clean comma-separated list, never bullets, prose, ratings, or keyword stuffing.
 - Use bullets for achievements under Experience and Projects. Start each with a strong verb, keep it concise, and preserve every stated metric exactly.
 - Never estimate or recalculate years of experience. If the profile states a number of years, repeat that exact number or omit years entirely.
+- Never upgrade proficiency with adjectives such as "advanced", "expert", "deep", or "extensive" unless that exact level is explicitly supported by the profile.
 - Keep matchVerdictReason factual and professional. Never speculate that a hiring manager will "bend" requirements, mentor the candidate into a title, or make an exception.
  
 For projects and certifications, if the source profile contains a URL for an item, put it in the "link" field; otherwise leave "link" empty.
@@ -569,6 +576,7 @@ export default function App() {
     setStatus("Tailoring the resume…");
     try {
       const tailored = normalizeTailoredResult(await tailorResume(apiKey, profile, jd, customPrompt));
+      tailored.projectsStructured = rankProjectsByRelevance(tailored.projectsStructured, jd);
       const merged = { name: profile.name, title: profile.title, email: profile.email, phone: profile.phone, location: profile.location, linkedin: profile.linkedin, github: profile.github, website: profile.website, ...tailored };
       merged.keywordCoverage = computeKeywordCoverage(merged, jd);
       let t = buildLatex(merged);
@@ -790,6 +798,7 @@ export default function App() {
               <Field half label="Website" value={profile.website} onChange={setProfileField("website")} placeholder="janedoe.dev" />
             </Row>
             <SectionLabel>Your material (AI structures & tailors this)</SectionLabel>
+            <Field area rows={2} label="Current professional summary — preserve exact years and positioning" value={profile.summary} onChange={setProfileField("summary")} placeholder="Data analyst with 4 years of experience building dashboards and automated reporting." />
             <Field area rows={4} label="Experience * — roles, companies, dates, what you did" value={profile.experience} onChange={setProfileField("experience")} placeholder={"Data Engineer, Acme Corp (2021–present)\n- Built GCP data pipelines...\n- Cut costs 30%..."} />
             <Field area rows={3} label="Skills" value={profile.skills} onChange={setProfileField("skills")} placeholder="Python, SQL, BigQuery, dbt, Airflow, GCP…" />
             <Field area rows={3} label="Projects — add a repo URL after each for a clickable link" value={profile.projects} onChange={setProfileField("projects")} placeholder={"Syndication Pipeline — dbt + BigQuery — github.com/you/syndication\nMarfeel ETL — Cloud Run — github.com/you/marfeel"} />
@@ -1125,6 +1134,11 @@ export function computeKeywordCoverage(resume, jd) {
   }
   return { matched, missing, pct: Math.round((matched.length / kws.length) * 100) };
 }
+export function rankProjectsByRelevance(projects, jd) {
+  const terms = new Set(normalizeText(jd).split(" ").filter((term) => term.length > 2 && !STOPWORDS.has(term)));
+  const score = (project) => normalizeText([project.name, project.tech, ...(project.bullets || [])].join(" ")).split(" ").reduce((total, term) => total + (terms.has(term) ? 1 : 0), 0);
+  return [...(projects || [])].map((project, index) => ({ project, index, score: score(project) })).sort((a, b) => b.score - a.score || a.index - b.index).map(({ project }) => project);
+}
 function Row({ children }) { return <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>{children}</div>; }
 function SectionLabel({ children }) { return <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.6, textTransform: "uppercase", color: P.accentDeep, margin: "14px 0 8px" }}>{children}</div>; }
 function QA({ q, a }) {
@@ -1171,7 +1185,7 @@ function renderResumeInner(r) {
   };
   const contactParts = [
     r.email && link(r.email, r.email, true), r.phone && e2(r.phone), r.location && e2(r.location),
-    r.linkedin && link(r.linkedin, "LinkedIn"), r.github && link(r.github, "GitHub"), r.website && link(r.website, "Website"),
+    r.linkedin && link(r.linkedin, displayWebUrl(r.linkedin)), r.github && link(r.github, displayWebUrl(r.github)), r.website && link(r.website, displayWebUrl(r.website)),
   ].filter(Boolean);
   const sec = (t, body) => body ? `<h2 style="font-size:13px;border-bottom:1px solid #333;margin:12px 0 6px;padding-bottom:2px;text-transform:uppercase;letter-spacing:1px">${t}</h2>${body}` : "";
   const exp = (r.experienceStructured || []).map((e) => `<div style="margin-bottom:8px"><div style="display:flex;justify-content:space-between"><strong>${e2(e.role)}</strong><span>${e2(e.dates)}</span></div><div style="font-style:italic;color:#333">${e2(e.company)}${e.location ? ", " + e2(e.location) : ""}</div><ul style="margin:4px 0 0;padding-left:18px">${(e.bullets || []).map((b) => `<li>${e2(b)}</li>`).join("")}</ul></div>`).join("");

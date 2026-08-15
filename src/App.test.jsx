@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { computeKeywordCoverage, normalizeProfile, normalizeSkills, normalizeTailoredResult, parseResumeTextLocally, safeWebUrl } from "./App.jsx";
+import { computeKeywordCoverage, normalizeProfile, normalizeSkills, normalizeTailoredResult, parseResumeTextLocally, rankProjectsByRelevance, safeWebUrl } from "./App.jsx";
 
 describe("safeWebUrl", () => {
   it("normalizes normal web links", () => expect(safeWebUrl("github.com/example")).toBe("https://github.com/example"));
@@ -28,14 +28,24 @@ describe("normalizeProfile", () => {
     const profile = normalizeProfile({ name: { unexpected: true }, email: null, skills: ["SQL"], experience: "Real experience" }, "Test");
     expect(profile).toMatchObject({ name: "", email: "", skills: "", experience: "Real experience", _label: "Test" });
   });
+  it("removes a legacy website hallucinated from the email local-part", () => {
+    expect(normalizeProfile({ email: "jordan.lee@example.com", website: "jordan.lee" }).website).toBe("");
+  });
 });
 
 describe("local text resume parsing", () => {
   it("extracts a structured text resume without an API call", () => {
-    const profile = parseResumeTextLocally("Jordan Lee\nData Analyst\njordan@example.com | +1 555-123-4567\n\nSKILLS\nSQL, Python\n\nEXPERIENCE\nData Analyst — Acme\n- Built reports");
-    expect(profile).toMatchObject({ name: "Jordan Lee", title: "Data Analyst", email: "jordan@example.com", skills: "SQL, Python" });
+    const profile = parseResumeTextLocally("Jordan Lee\nData Analyst\njordan@example.com | +1 555-123-4567 | Raleigh, NC\n\nSUMMARY\nData analyst with 4 years of experience.\n\nSKILLS\nSQL, Python\n\nEXPERIENCE\nData Analyst — Acme\n- Built reports");
+    expect(profile).toMatchObject({ name: "Jordan Lee", title: "Data Analyst", email: "jordan@example.com", location: "Raleigh, NC", summary: "Data analyst with 4 years of experience.", skills: "SQL, Python" });
     expect(profile.experience).toContain("Built reports");
     expect(profile.website).toBe("");
+  });
+});
+
+describe("project relevance", () => {
+  it("puts the job-relevant project first without changing project content", () => {
+    const projects = [{ name: "Churn", tech: "Python" }, { name: "BI Dashboard", tech: "Power BI, SQL" }];
+    expect(rankProjectsByRelevance(projects, "Build Power BI dashboards with SQL")[0].name).toBe("BI Dashboard");
   });
 });
 
